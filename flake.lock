@@ -12,12 +12,12 @@
         "utils": "utils"
       },
       "locked": {
-        "dirtyRev": "a0495c3d80934eabf3dacca5ee2c6d262163b960-dirty",
-        "dirtyShortRev": "a0495c3-dirty",
         "lastModified": 1704389058,
-        "narHash": "sha256-DYRUq2Qym347EvnhfD/eVLNkwfmb/pyxaFf21RdYuz0=",
-        "type": "git",
-        "url": "file:///Users/jasonrm/repos/github.com/jasonrm/nix-chips"
+        "narHash": "sha256-pRVaR9OEsStmMTOQIufJSXQaZbe102xfdO/InWRxo2I=",
+        "owner": "jasonrm",
+        "repo": "nix-chips",
+        "rev": "a0495c3d80934eabf3dacca5ee2c6d262163b960",
+        "type": "github"
       },
       "original": {
         "owner": "jasonrm",
@@ -67,11 +67,11 @@
         ]
       },
       "locked": {
-        "lastModified": 1704383912,
-        "narHash": "sha256-Be7O73qoOj/z+4ZCgizdLlu+5BkVvO2KO299goZ9cW8=",
+        "lastModified": 1704498488,
+        "narHash": "sha256-yINKdShHrtjdiJhov+q0s3Y3B830ujRoSbHduUNyKag=",
         "owner": "nix-community",
         "repo": "home-manager",
-        "rev": "26b8adb300e50efceb51fff6859a1a6ba1ade4f7",
+        "rev": "51e44a13acea71b36245e8bd8c7db53e0a3e61ee",
         "type": "github"
       },
       "original": {
@@ -103,11 +103,11 @@
         "utils": "utils_2"
       },
       "locked": {
-        "lastModified": 1703690653,
-        "narHash": "sha256-OD4S4IqGrgPLh5B1AvvubQBSg/8/6OyrLNxiAouaDKI=",
+        "lastModified": 1704700642,
+        "narHash": "sha256-zVrrn5bcrl8hIgeDHq7sIzR55Zcfl/x6erow60+dfE8=",
         "owner": "jasonrm",
         "repo": "nixpkgs-staging",
-        "rev": "63c47f2c459454667bb416421f10115db8f885f0",
+        "rev": "ada0ae19d995fe880714ba2e98730df69acfa9f4",
         "type": "github"
       },
       "original": {
