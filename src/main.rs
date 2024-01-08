@@ -2,8 +2,11 @@ use age::armor::{ArmoredReader, Format};
 use age::cli_common::read_identities;
 use age::{Identity, Recipient};
 use clap::{Parser, Subcommand};
+use digest::Digest;
+use dirs::cache_dir;
 use edit::{edit_file, get_editor};
 use serde::{Deserialize, Serialize};
+use sha3::Sha3_256;
 use std::collections::{BTreeSet, HashMap};
 use std::io::{Read, Write};
 use std::path::{Path, PathBuf};
@@ -20,9 +23,6 @@ struct Cli {
 
     #[clap(long)]
     identity: Vec<PathBuf>,
-
-    #[clap(long, default_value = ".chips/arcanum.json")]
-    cache_file: PathBuf,
 }
 
 #[derive(Subcommand)]
@@ -153,7 +153,7 @@ fn main() {
 
     let cli = Cli::parse();
 
-    let cache_file_path = project_root.join(&cli.cache_file);
+    let cache_file_path = cache_file_path(&project_root);
     let cache: CacheFile = load_cache_file(&project_root, &cache_file_path);
 
     let identities = identity_files(&cli);
@@ -233,9 +233,23 @@ fn main() {
             std::fs::write(ciphertext, ciphertext_data).unwrap();
         }
         Commands::Cache => {
-            generate_cache_file(&project_root, &cli.cache_file);
+            generate_cache_file(&project_root, &cache_file_path);
         }
     }
+}
+
+fn cache_file_path(project_root: &Path) -> PathBuf {
+    let mut hasher = Sha3_256::new();
+    hasher.update(project_root.to_string_lossy().as_bytes());
+    let hash = hasher.finalize();
+    let hash = format!("{:x}", hash)[..8].to_string();
+    let cache_file_name = format!("arcanum-{}.json", hash);
+    let dir = cache_dir().unwrap();
+    if !dir.exists() {
+        std::fs::create_dir_all(&dir).unwrap();
+    }
+    let cache_path = dir.join(cache_file_name);
+    cache_path
 }
 
 fn identity_files(cli: &Cli) -> Vec<String> {

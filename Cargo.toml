@@ -9,11 +9,13 @@ edition = "2021"
 age = { version = "0.9", features = ["armor", "ssh", "cli-common"] }
 anyhow = "1"
 clap = { version = "4", features = ["derive", "env"] }
+digest = "0.10.7"
 dirs = "5"
 edit = "0.1"
 env_logger = "0.10"
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
+sha3 = "0.10.8"
 temp-file = "0.1"
 toor = "0.2"
 tracing = "0.1"
