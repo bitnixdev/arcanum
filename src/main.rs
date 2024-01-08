@@ -4,31 +4,22 @@ use age::{Identity, Recipient};
 use clap::{Parser, Subcommand};
 use edit::{edit_file, get_editor};
 use serde::{Deserialize, Serialize};
-use std::collections::HashMap;
+use std::collections::{BTreeSet, HashMap};
 use std::io::{Read, Write};
 use std::path::{Path, PathBuf};
+use std::process::Command;
 use std::str::FromStr;
 use toor::project::find_project_root;
-use tracing::info;
-use whoami::{hostname, username};
-
-#[derive(clap::ValueEnum, Clone, Debug)]
-#[clap(rename_all = "kebab_case")]
-enum Context {
-    DevShell,
-    NixOs,
-    HomeManager,
-}
 
 #[derive(Parser)]
 #[command(author, version, about, long_about = None)]
 #[command(propagate_version = true)]
 struct Cli {
-    #[clap(long, value_enum)]
-    context: Context,
-
     #[command(subcommand)]
     command: Commands,
+
+    #[clap(long)]
+    identity: Vec<PathBuf>,
 
     #[clap(long, default_value = ".chips/arcanum.json")]
     cache_file: PathBuf,
@@ -36,23 +27,31 @@ struct Cli {
 
 #[derive(Subcommand)]
 enum Commands {
+    /// Encrypt a file
     Encrypt {
-        source: PathBuf,
-        from: Option<PathBuf>,
+        plaintext: PathBuf,
+        ciphertext: PathBuf,
     },
+
+    /// Decrypt a file
     Decrypt {
-        source: PathBuf,
-        to: Option<PathBuf>,
+        ciphertext: PathBuf,
+        plaintext: PathBuf,
     },
-    Edit {
-        source: PathBuf,
-    },
-    Rekey {
-        source: Option<PathBuf>,
-    },
+
+    /// Edit the plaintext of a file
+    Edit { ciphertext: PathBuf },
+
+    /// Re-encrypt a file to all configured recipients
+    Rekey { ciphertext: PathBuf },
+
+    /// Regenerate a cache file for the current project
+    ///
+    /// Needed when adding new files to the project or changing the recipients.
+    Cache,
 }
 
-#[derive(Debug, Serialize, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 struct ArcanumFile {
     dest: PathBuf,
@@ -67,12 +66,79 @@ struct ArcanumFile {
 
 #[derive(Debug, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
+struct ArcanumConfig {
+    files: HashMap<String, ArcanumFile>,
+    admin_recipients: Vec<String>,
+}
+
+#[derive(Debug, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
 struct CacheFile {
-    dev_shells: HashMap<String, HashMap<String, HashMap<String, ArcanumFile>>>,
-    // flakes: HashMap<String, ArcanumFile>,
-    // home_manager: HashMap<String, HashMap<String, HashMap<String, ArcanumFile>>>,
-    // nixos: HashMap<String, HashMap<String, HashMap<String, ArcanumFile>>>,
-    // nixos_admin_recipients: Vec<String>,
+    nixos: Option<HashMap<String, ArcanumConfig>>,
+    dev_shells: Option<HashMap<String, HashMap<String, ArcanumConfig>>>,
+    home_manager: Option<HashMap<String, HashMap<String, ArcanumConfig>>>,
+    flake: Option<ArcanumConfig>,
+}
+
+impl CacheFile {
+    fn recipients_for_file(&self, source: &Path) -> Vec<Box<dyn Recipient + Send>> {
+        let mut recipients: BTreeSet<String> = BTreeSet::new();
+        let flake = self.flake.as_ref().unwrap();
+        for (_, file) in &flake.files {
+            if source == file.source {
+                recipients.extend(file.recipients.clone());
+                recipients.extend(flake.admin_recipients.clone());
+            }
+        }
+
+        for (_, config) in self.nixos.as_ref().unwrap() {
+            for (_, file) in &config.files {
+                if source == file.source {
+                    recipients.extend(file.recipients.clone());
+                    recipients.extend(config.admin_recipients.clone());
+                }
+            }
+        }
+
+        for (_, config) in self.home_manager.as_ref().unwrap() {
+            for (_, system) in config {
+                for (_, file) in &system.files {
+                    if source == file.source {
+                        recipients.extend(file.recipients.clone());
+                        recipients.extend(system.admin_recipients.clone());
+                    }
+                }
+            }
+        }
+
+        for (_, config) in self.dev_shells.as_ref().unwrap() {
+            for (_, system) in config {
+                for (_, file) in &system.files {
+                    if source == file.source {
+                        recipients.extend(file.recipients.clone());
+                        recipients.extend(system.admin_recipients.clone());
+                    }
+                }
+            }
+        }
+
+        if !recipients.is_empty() {
+            eprintln!("Recipients for {}:", source.display());
+            for recipient in &recipients {
+                eprintln!(" - {}", recipient);
+            }
+        }
+
+        let mut boxed_recipients: Vec<Box<dyn Recipient + Send>> = vec![];
+        for r in &recipients {
+            if r.starts_with("age1") {
+                boxed_recipients.push(Box::new(age::x25519::Recipient::from_str(r).unwrap()))
+            } else {
+                boxed_recipients.push(Box::new(age::ssh::Recipient::from_str(r).unwrap()))
+            }
+        }
+        boxed_recipients
+    }
 }
 
 fn main() {
@@ -85,145 +151,144 @@ fn main() {
     }
     let project_root = project_root.unwrap();
 
-    info!("project_root: {:?}", project_root);
-
     let cli = Cli::parse();
 
-    let file = Path::new(&cli.cache_file);
-    if !file.exists() {
-        panic!("Cache file does not exist: {:?}", file);
-    }
-    let data = std::fs::read_to_string(file).unwrap();
-    let cache: CacheFile = serde_json::from_str(&data).unwrap();
+    let cache_file_path = project_root.join(&cli.cache_file);
+    let cache: CacheFile = load_cache_file(&project_root, &cache_file_path);
 
-    let files = match &cli.context {
-        Context::DevShell => dev_shell_files(cache),
-        Context::HomeManager => dev_shell_files(cache),
-        Context::NixOs => dev_shell_files(cache),
-    };
-    let files = files.unwrap();
+    let identities = identity_files(&cli);
 
     // You can check for the existence of subcommands, and if found use their
     // matches just as you would the top level cmd
     match &cli.command {
-        Commands::Encrypt { source, from } => {
-            let (_, matching_config) = files
-                .iter()
-                .find(|(_, file)| *source == file.source)
-                .unwrap();
-            let plaintext = match from {
-                Some(from) => {
-                    if from.display().to_string() == "-" {
-                        info!("reading from stdin");
-                        let mut buffer = String::new();
-                        std::io::stdin().read_to_string(&mut buffer).unwrap();
-                        buffer.into_bytes()
-                    } else if from.exists() {
-                        std::fs::read(from).unwrap()
-                    } else {
-                        info!("from does not exist: {:?}", from);
-                        vec![]
-                    }
-                }
-                None => {
-                    let dest = &matching_config.dest;
-                    if dest.exists() {
-                        std::fs::read(dest).unwrap()
-                    } else {
-                        info!("dest does not exist: {:?}", dest);
-                        vec![]
-                    }
-                }
+        Commands::Encrypt {
+            plaintext,
+            ciphertext,
+        } => {
+            let data = if plaintext.display().to_string() == "-" {
+                let mut buffer = String::new();
+                std::io::stdin().read_to_string(&mut buffer).unwrap();
+                buffer.into_bytes()
+            } else if plaintext.exists() {
+                std::fs::read(plaintext).unwrap()
+            } else {
+                eprintln!("plaintext does not exist at {:?}, aborting", plaintext);
+                return;
             };
-            let recipients = recipients_for_file(matching_config);
-            let encrypted = ciphertext_from_plaintext_buffer(&plaintext, recipients);
-            std::fs::write(source, encrypted).unwrap();
-        }
-        Commands::Decrypt { source, to } => {
-            let dest = match to {
-                Some(to) => to,
-                None => {
-                    let (_, matching_config) = files
-                        .iter()
-                        .find(|(_, file)| *source == file.source)
-                        .unwrap();
-                    &matching_config.dest
-                }
-            };
-            let plaintext = plaintext_from_ciphertext_source(source);
-            if plaintext.is_empty() {
-                info!("plaintext is empty, not writing to {:?}", dest);
+            let recipients = cache.recipients_for_file(ciphertext);
+            if recipients.is_empty() {
+                eprintln!("No recipients found for {:?}", ciphertext);
                 return;
             }
-            std::fs::write(dest, plaintext).unwrap();
-            info!("Wrote plaintext to {:?}", dest);
+            let ciphertext_data = ciphertext_from_plaintext_buffer(&data, recipients);
+            std::fs::write(ciphertext, ciphertext_data).unwrap();
         }
-        Commands::Rekey { source } => {
-            info!("'Rekey' was used, source is: {:?}", source);
-            let target_files = match source {
-                Some(source) => {
-                    let (_, matching_config) = files
-                        .iter()
-                        .find(|(_, file)| *source == file.source)
-                        .unwrap();
-                    vec![matching_config]
+        Commands::Decrypt {
+            ciphertext,
+            plaintext,
+        } => {
+            if plaintext.display().to_string() == "-" {
+                let plaintext_data = plaintext_from_ciphertext_source(ciphertext, identities);
+                std::io::stdout().write_all(&plaintext_data).unwrap();
+            } else {
+                let plaintext_data = plaintext_from_ciphertext_source(ciphertext, identities);
+                if plaintext_data.is_empty() {
+                    eprintln!("plaintext is empty, not writing to {:?}", plaintext);
+                    return;
                 }
-                None => files.values().collect(),
-            };
-            for matching_config in target_files {
-                let plaintext = plaintext_from_ciphertext_source(&matching_config.source);
-                let recipients = recipients_for_file(matching_config);
-                let encrypted = ciphertext_from_plaintext_buffer(&plaintext, recipients);
-                std::fs::write(&matching_config.source, encrypted).unwrap();
-                info!("Rekeyed ciphertext at {:?}", matching_config.source);
+                std::fs::write(plaintext, plaintext_data).unwrap();
+                eprintln!("Wrote plaintext to {:?}", plaintext);
             }
         }
-        Commands::Edit { source } => {
-            let (_, matching_config) = files
-                .iter()
-                .find(|(_, file)| *source == file.source)
-                .unwrap();
-            let contents = plaintext_from_ciphertext_source(source);
-            let t = temp_file::with_contents(&contents);
-            info!(
+        Commands::Rekey { ciphertext } => {
+            let plaintext_data = plaintext_from_ciphertext_source(ciphertext, identities);
+            let recipients = cache.recipients_for_file(ciphertext);
+            let ciphertext_data = ciphertext_from_plaintext_buffer(&plaintext_data, recipients);
+            std::fs::write(ciphertext, ciphertext_data).unwrap();
+            eprintln!("Rekeyed ciphertext at {:?}", ciphertext);
+        }
+        Commands::Edit { ciphertext } => {
+            let original_plaintext_data = plaintext_from_ciphertext_source(ciphertext, identities);
+            let t = temp_file::with_contents(&original_plaintext_data);
+            eprintln!(
                 "Opening plaintext in editor: {}",
                 get_editor().unwrap().display()
             );
             edit_file(&t.path()).unwrap();
-            let plaintext = std::fs::read(t.path()).unwrap();
-            if plaintext.is_empty() {
-                info!("edited plaintext is empty, not writing to {:?}", source);
+            let plaintext_data = std::fs::read(t.path()).unwrap();
+            if plaintext_data.is_empty() {
+                eprintln!("edited plaintext is empty, not writing to {:?}", ciphertext);
                 return;
             }
-            if plaintext == contents {
-                info!("edited plaintext is unchanged, not writing to {:?}", source);
-                info!(
-                    "If you want to re-encrypt the files to new recipents, use the 'rekey' command"
+            if plaintext_data == original_plaintext_data {
+                eprintln!("Plaintext is unchanged, not writing to {:?}", ciphertext);
+                eprintln!(
+                    "If you want to re-encrypt the files to new recipents, use the 'rekey' command."
                 );
                 return;
             }
-            let recipients = recipients_for_file(matching_config);
+            let recipients = cache.recipients_for_file(ciphertext);
 
-            let encrypted = ciphertext_from_plaintext_buffer(&plaintext, recipients);
-            std::fs::write(source, encrypted).unwrap();
-            info!("Wrote ciphertext to {:?}", source);
+            let ciphertext_data = ciphertext_from_plaintext_buffer(&plaintext_data, recipients);
+            std::fs::write(ciphertext, ciphertext_data).unwrap();
+        }
+        Commands::Cache => {
+            generate_cache_file(&project_root, &cli.cache_file);
         }
     }
 }
 
-fn recipients_for_file(matching_config: &ArcanumFile) -> Vec<Box<dyn Recipient + Send>> {
-    let mut recipients: Vec<Box<dyn Recipient + Send>> = vec![];
-    for r in &matching_config.recipients {
-        if r.starts_with("age1") {
-            recipients.push(Box::new(age::x25519::Recipient::from_str(r).unwrap()))
-        } else {
-            recipients.push(Box::new(age::ssh::Recipient::from_str(r).unwrap()))
+fn identity_files(cli: &Cli) -> Vec<String> {
+    let mut identities = vec![];
+    for identity in &cli.identity {
+        if identity.exists() {
+            identities.push(identity.clone().display().to_string());
         }
     }
-    recipients
+    let default_identities = vec![
+        dirs::home_dir().unwrap().join(".ssh/id_ed25519"),
+        dirs::home_dir().unwrap().join(".ssh/id_rsa"),
+    ];
+    for identity in default_identities {
+        if identity.exists() {
+            identities.push(identity.display().to_string());
+        }
+    }
+    identities
 }
 
-fn plaintext_from_ciphertext_source(source: &PathBuf) -> Vec<u8> {
+fn load_cache_file(project_root: &Path, cache: &Path) -> CacheFile {
+    if cache.exists() {
+        let data = std::fs::read_to_string(cache).unwrap();
+        let cache_file: CacheFile = serde_json::from_str(&data).unwrap();
+        cache_file
+    } else {
+        generate_cache_file(project_root, cache)
+    }
+}
+
+fn generate_cache_file(project_root: &Path, cache: &Path) -> CacheFile {
+    let result = Command::new("nix")
+        .arg("eval")
+        .arg("--json")
+        .arg(".#lib.arcanum")
+        .current_dir(project_root)
+        .output()
+        .unwrap();
+    if !result.status.success() {
+        eprintln!("nix eval failed");
+        eprintln!("stdout: {}", String::from_utf8_lossy(&result.stdout));
+        eprintln!("stderr: {}", String::from_utf8_lossy(&result.stderr));
+        std::process::exit(1);
+    }
+    let data = String::from_utf8(result.stdout).unwrap();
+    let cache_file: CacheFile = serde_json::from_str(&data).unwrap();
+    std::fs::write(cache, data).unwrap();
+
+    cache_file
+}
+
+fn plaintext_from_ciphertext_source(source: &PathBuf, identities: Vec<String>) -> Vec<u8> {
     let contents = if source.exists() {
         let encrypted = std::fs::read(source).unwrap();
         let armor_reader = ArmoredReader::new(&encrypted[..]);
@@ -233,23 +298,14 @@ fn plaintext_from_ciphertext_source(source: &PathBuf) -> Vec<u8> {
         };
 
         let mut decrypted = vec![];
-        let home_directory = dirs::home_dir().unwrap();
-        let identity = read_identities(
-            vec![
-                // TODO: check if these files exist before adding them
-                home_directory.join(".ssh/id_ed25519").display().to_string(),
-                // home_directory.join(".ssh/id_rsa").display().to_string(),
-            ],
-            Some(30),
-        )
-        .unwrap();
+        let identity = read_identities(identities, Some(30)).unwrap();
         let identity_refs: Vec<&dyn Identity> = identity.iter().map(|i| i.as_ref()).collect();
         let mut reader = decryptor.decrypt(identity_refs.into_iter()).unwrap();
         reader.read_to_end(&mut decrypted).unwrap();
 
         decrypted
     } else {
-        info!("source does not exist: {:?}", source);
+        eprintln!("ciphertext does not exist: {:?}", source);
         vec![]
     };
     contents
@@ -268,28 +324,4 @@ fn ciphertext_from_plaintext_buffer(
     writer.finish().unwrap();
     armored_writer.finish().unwrap();
     encrypted
-}
-
-fn nixos_arch_platform() -> String {
-    let arch = std::env::consts::ARCH;
-    let platform = match std::env::consts::OS {
-        "macos" => "darwin",
-        platform => platform,
-    };
-    format!("{}-{}", arch, platform)
-}
-
-fn dev_shell_files(mut cache_file: CacheFile) -> Option<HashMap<String, ArcanumFile>> {
-    let system_config = cache_file.dev_shells.remove(&nixos_arch_platform());
-    match system_config {
-        Some(mut system_config) => {
-            let user_host = format!("{}-{}", username(), hostname());
-            let user_host_config = system_config.remove(&user_host);
-            match user_host_config {
-                Some(user_host_config) => Some(user_host_config),
-                None => system_config.remove("default"),
-            }
-        }
-        None => None,
-    }
 }

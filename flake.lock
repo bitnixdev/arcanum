@@ -15,7 +15,7 @@
         "dirtyRev": "a0495c3d80934eabf3dacca5ee2c6d262163b960-dirty",
         "dirtyShortRev": "a0495c3-dirty",
         "lastModified": 1704389058,
-        "narHash": "sha256-/nGYiliT6yD4ZdtzDP/Fak5gn823R4Tzd9rC+ZmYXbY=",
+        "narHash": "sha256-DYRUq2Qym347EvnhfD/eVLNkwfmb/pyxaFf21RdYuz0=",
         "type": "git",
         "url": "file:///Users/jasonrm/repos/github.com/jasonrm/nix-chips"
       },
