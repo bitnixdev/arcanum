@@ -142,8 +142,6 @@ impl CacheFile {
 }
 
 fn main() {
-    tracing_subscriber::fmt::init();
-
     let cwd = std::env::current_dir().unwrap();
     let project_root = find_project_root(cwd);
     if project_root.is_none() {
