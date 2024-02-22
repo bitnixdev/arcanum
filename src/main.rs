@@ -154,6 +154,7 @@ fn main() {
     let cli = Cli::parse();
 
     let cache_file_path = cache_file_path(&project_root);
+    eprintln!("Using cache file at {:?}", cache_file_path);
     let cache: CacheFile = load_cache_file(&project_root, &cache_file_path);
 
     let identities = identity_files(&cli);
@@ -182,6 +183,7 @@ fn main() {
             }
             let ciphertext_data = ciphertext_from_plaintext_buffer(&data, recipients);
             std::fs::write(ciphertext, ciphertext_data).unwrap();
+            eprintln!("Wrote ciphertext to {:?}", ciphertext);
         }
         Commands::Decrypt {
             ciphertext,
@@ -208,8 +210,17 @@ fn main() {
             eprintln!("Rekeyed ciphertext at {:?}", ciphertext);
         }
         Commands::Edit { ciphertext } => {
-            let original_plaintext_data = plaintext_from_ciphertext_source(ciphertext, identities);
-            let t = temp_file::with_contents(&original_plaintext_data);
+            let recipients = cache.recipients_for_file(ciphertext);
+            if recipients.is_empty() {
+                eprintln!("No recipients found, unable to edit.");
+                std::process::exit(1);
+            }
+
+            let original_plaintext_data = plaintext_from_ciphertext_source(ciphertext, identities.clone());
+            let file_stem = PathBuf::from(ciphertext.file_stem().unwrap());
+            let extension = file_stem.extension().unwrap().to_str().unwrap();
+            let t = temp_file::TempFile::with_suffix(format!(".{}", extension)).unwrap();
+            std::fs::write(t.path(), &original_plaintext_data).unwrap();
             eprintln!(
                 "Opening plaintext in editor: {}",
                 get_editor().unwrap().display()
@@ -227,10 +238,14 @@ fn main() {
                 );
                 return;
             }
-            let recipients = cache.recipients_for_file(ciphertext);
-
             let ciphertext_data = ciphertext_from_plaintext_buffer(&plaintext_data, recipients);
+            let ciphertext_temp = temp_file::with_contents(&ciphertext_data);
+
+            // Verify we can decrypt the new ciphertext
+            plaintext_from_ciphertext_source(ciphertext_temp.path(), identities);
+
             std::fs::write(ciphertext, ciphertext_data).unwrap();
+            eprintln!("Wrote ciphertext to {:?}", ciphertext);
         }
         Commands::Cache => {
             generate_cache_file(&project_root, &cache_file_path);
@@ -302,7 +317,7 @@ fn generate_cache_file(project_root: &Path, cache: &Path) -> CacheFile {
     cache_file
 }
 
-fn plaintext_from_ciphertext_source(source: &PathBuf, identities: Vec<String>) -> Vec<u8> {
+fn plaintext_from_ciphertext_source(source: &Path, identities: Vec<String>) -> Vec<u8> {
     let contents = if source.exists() {
         let encrypted = std::fs::read(source).unwrap();
         let armor_reader = ArmoredReader::new(&encrypted[..]);
@@ -314,7 +329,12 @@ fn plaintext_from_ciphertext_source(source: &PathBuf, identities: Vec<String>) -
         let mut decrypted = vec![];
         let identity = read_identities(identities, Some(30)).unwrap();
         let identity_refs: Vec<&dyn Identity> = identity.iter().map(|i| i.as_ref()).collect();
-        let mut reader = decryptor.decrypt(identity_refs.into_iter()).unwrap();
+        let reader = decryptor.decrypt(identity_refs.into_iter());
+        if reader.is_err() {
+            eprintln!("You do not have an identity able to decrypt this file. Exiting.");
+            std::process::exit(1);
+        }
+        let mut reader = reader.unwrap();
         reader.read_to_end(&mut decrypted).unwrap();
 
         decrypted
