@@ -1,5 +1,5 @@
 use age::armor::{ArmoredReader, Format};
-use age::cli_common::read_identities;
+use age::cli_common::{StdinGuard, read_identities};
 use age::{Identity, Recipient};
 use clap::{Parser, Subcommand};
 use digest::Digest;
@@ -12,6 +12,7 @@ use std::io::{Read, Write};
 use std::path::{Path, PathBuf};
 use std::process::Command;
 use std::str::FromStr;
+use toor::config::Config;
 use toor::project::find_project_root;
 
 #[derive(Parser)]
@@ -42,8 +43,8 @@ enum Commands {
     /// Edit the plaintext of a file
     Edit { ciphertext: PathBuf },
 
-    /// Re-encrypt a file to all configured recipients
-    Rekey { ciphertext: PathBuf },
+    /// Re-encrypt a file to all configured recipients, or all files if none specified
+    Rekey { ciphertext: Option<PathBuf> },
 
     /// Regenerate a cache file for the current project
     ///
@@ -143,7 +144,8 @@ impl CacheFile {
 
 fn main() {
     let cwd = std::env::current_dir().unwrap();
-    let project_root = find_project_root(cwd);
+    let config = Config { root_pattern: None };
+    let project_root = find_project_root(cwd, config);
     if project_root.is_none() {
         panic!("Could not find project root, are you in a project?");
     }
@@ -201,11 +203,89 @@ fn main() {
             }
         }
         Commands::Rekey { ciphertext } => {
-            let plaintext_data = plaintext_from_ciphertext_source(ciphertext, identities);
-            let recipients = cache.recipients_for_file(ciphertext);
-            let ciphertext_data = ciphertext_from_plaintext_buffer(&plaintext_data, recipients);
-            std::fs::write(ciphertext, ciphertext_data).unwrap();
-            eprintln!("Rekeyed ciphertext at {:?}", ciphertext);
+            if let Some(ciphertext_path) = ciphertext {
+                // Rekey single file
+                let plaintext_data = plaintext_from_ciphertext_source(ciphertext_path, identities);
+                let recipients = cache.recipients_for_file(ciphertext_path);
+                let ciphertext_data = ciphertext_from_plaintext_buffer(&plaintext_data, recipients);
+                std::fs::write(ciphertext_path, ciphertext_data).unwrap();
+                eprintln!("Rekeyed ciphertext at {:?}", ciphertext_path);
+            } else {
+                // Rekey all files
+                let mut files_to_rekey = Vec::new();
+
+                // Collect all files from flake config
+                if let Some(flake_config) = &cache.flake {
+                    for (_, file) in &flake_config.files {
+                        if file.source.exists() {
+                            files_to_rekey.push(file.source.clone());
+                        }
+                    }
+                }
+
+                // Collect all files from nixos configs
+                if let Some(nixos_configs) = &cache.nixos {
+                    for (_, config) in nixos_configs {
+                        for (_, file) in &config.files {
+                            if file.source.exists() {
+                                files_to_rekey.push(file.source.clone());
+                            }
+                        }
+                    }
+                }
+
+                // Collect all files from home_manager configs
+                if let Some(home_manager_configs) = &cache.home_manager {
+                    for (_, config) in home_manager_configs {
+                        for (_, system) in config {
+                            for (_, file) in &system.files {
+                                if file.source.exists() {
+                                    files_to_rekey.push(file.source.clone());
+                                }
+                            }
+                        }
+                    }
+                }
+
+                // Collect all files from dev_shells configs
+                if let Some(dev_shells_configs) = &cache.dev_shells {
+                    for (_, config) in dev_shells_configs {
+                        for (_, system) in config {
+                            for (_, file) in &system.files {
+                                if file.source.exists() {
+                                    files_to_rekey.push(file.source.clone());
+                                }
+                            }
+                        }
+                    }
+                }
+
+                // Remove duplicates and sort
+                files_to_rekey.sort();
+                files_to_rekey.dedup();
+
+                if files_to_rekey.is_empty() {
+                    eprintln!("No files found to rekey");
+                    return;
+                }
+
+                eprintln!("Rekeying {} files...", files_to_rekey.len());
+
+                for file_path in files_to_rekey {
+                    eprintln!("Rekeying {:?}", file_path);
+                    let plaintext_data =
+                        plaintext_from_ciphertext_source(&file_path, identities.clone());
+                    let recipients = cache.recipients_for_file(&file_path);
+                    if recipients.is_empty() {
+                        eprintln!("No recipients found for {:?}, skipping", file_path);
+                        continue;
+                    }
+                    let ciphertext_data =
+                        ciphertext_from_plaintext_buffer(&plaintext_data, recipients);
+                    std::fs::write(&file_path, ciphertext_data).unwrap();
+                    eprintln!("Rekeyed ciphertext at {:?}", file_path);
+                }
+            }
         }
         Commands::Edit { ciphertext } => {
             let recipients = cache.recipients_for_file(ciphertext);
@@ -214,7 +294,8 @@ fn main() {
                 std::process::exit(1);
             }
 
-            let original_plaintext_data = plaintext_from_ciphertext_source(ciphertext, identities.clone());
+            let original_plaintext_data =
+                plaintext_from_ciphertext_source(ciphertext, identities.clone());
             let file_stem = PathBuf::from(ciphertext.file_stem().unwrap());
             let extension = file_stem.extension().unwrap().to_str().unwrap();
             let t = temp_file::TempFile::with_suffix(format!(".{}", extension)).unwrap();
@@ -319,13 +400,11 @@ fn plaintext_from_ciphertext_source(source: &Path, identities: Vec<String>) -> V
     let contents = if source.exists() {
         let encrypted = std::fs::read(source).unwrap();
         let armor_reader = ArmoredReader::new(&encrypted[..]);
-        let decryptor = match age::Decryptor::new(armor_reader).unwrap() {
-            age::Decryptor::Recipients(d) => d,
-            _ => unreachable!(),
-        };
+        let decryptor = age::Decryptor::new(armor_reader).unwrap();
 
         let mut decrypted = vec![];
-        let identity = read_identities(identities, Some(30)).unwrap();
+        let mut stdin_guard = StdinGuard::new(true);
+        let identity = read_identities(identities, Some(30), &mut stdin_guard).unwrap();
         let identity_refs: Vec<&dyn Identity> = identity.iter().map(|i| i.as_ref()).collect();
         let reader = decryptor.decrypt(identity_refs.into_iter());
         if reader.is_err() {
@@ -347,7 +426,14 @@ fn ciphertext_from_plaintext_buffer(
     plaintext: &[u8],
     recipients: Vec<Box<dyn Recipient + Send>>,
 ) -> Vec<u8> {
-    let encryptor = age::Encryptor::with_recipients(recipients).unwrap();
+    let recipient_refs: Vec<&dyn Recipient> = recipients
+        .iter()
+        .map(|r| {
+            let boxed_ref: &(dyn Recipient + Send) = r.as_ref();
+            boxed_ref as &dyn Recipient
+        })
+        .collect();
+    let encryptor = age::Encryptor::with_recipients(recipient_refs.iter().copied()).unwrap();
     let mut encrypted = vec![];
     let mut armored_writer =
         age::armor::ArmoredWriter::wrap_output(&mut encrypted, Format::AsciiArmor).unwrap();

@@ -1,18 +1,18 @@
 [package]
 name = "arcanum"
-version = "0.3.0"
-edition = "2021"
+version = "0.4.0"
+edition = "2024"
 
 # See more keys and their definitions at https://doc.rust-lang.org/cargo/reference/manifest.html
 
 [dependencies]
-age = { version = "0.9", features = ["armor", "ssh", "cli-common"] }
+age = { version = "0.11", features = ["armor", "ssh", "cli-common"] }
 clap = { version = "4", features = ["derive", "env"] }
-digest = "0.10.7"
-dirs = "5"
+digest = "0.10"
+dirs = "6"
 edit = "0.1"
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
-sha3 = "0.10.8"
+sha3 = "0.10"
 temp-file = "0.1"
-toor = "0.2"
+toor = "0.4"
