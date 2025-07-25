@@ -296,8 +296,10 @@ fn main() {
 
             let original_plaintext_data =
                 plaintext_from_ciphertext_source(ciphertext, identities.clone());
-            let file_stem = PathBuf::from(ciphertext.file_stem().unwrap());
-            let extension = file_stem.extension().unwrap().to_str().unwrap();
+            let extension = ciphertext
+                .extension()
+                .and_then(|ext| ext.to_str())
+                .unwrap_or("txt");
             let t = temp_file::TempFile::with_suffix(format!(".{}", extension)).unwrap();
             std::fs::write(t.path(), &original_plaintext_data).unwrap();
             eprintln!(
