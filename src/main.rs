@@ -46,6 +46,9 @@ enum Commands {
     /// Re-encrypt a file to all configured recipients, or all files if none specified
     Rekey { ciphertext: Option<PathBuf> },
 
+    /// Resolve merge conflicts in an encrypted file
+    Merge { ciphertext: PathBuf },
+
     /// Regenerate a cache file for the current project
     ///
     /// Needed when adding new files to the project or changing the recipients.
@@ -327,6 +330,470 @@ fn main() {
 
             std::fs::write(ciphertext, ciphertext_data).unwrap();
             eprintln!("Wrote ciphertext to {:?}", ciphertext);
+        }
+        Commands::Merge { ciphertext } => {
+            let recipients = cache.recipients_for_file(ciphertext);
+            if recipients.is_empty() {
+                eprintln!("No recipients found for {:?}", ciphertext);
+                return;
+            }
+
+            // Check if file has merge conflicts
+            let file_content = match std::fs::read_to_string(ciphertext) {
+                Ok(content) => content,
+                Err(e) => {
+                    eprintln!("Failed to read file {:?}: {}", ciphertext, e);
+                    return;
+                }
+            };
+
+            if !file_content.contains("<<<<<<< ") || !file_content.contains(">>>>>>> ") {
+                eprintln!(
+                    "File {:?} does not appear to have merge conflicts",
+                    ciphertext
+                );
+                return;
+            }
+
+            eprintln!("Resolving merge conflicts in {:?}", ciphertext);
+
+            // Extract the conflicting versions using git show
+            let relative_path = if ciphertext.is_absolute() {
+                match ciphertext.strip_prefix(&project_root) {
+                    Ok(path) => path,
+                    Err(_) => {
+                        eprintln!(
+                            "File {:?} is not within project root {:?}",
+                            ciphertext, project_root
+                        );
+                        return;
+                    }
+                }
+            } else {
+                // Already a relative path
+                ciphertext.as_path()
+            };
+
+            // Check if we're in the middle of a merge or rebase
+            let merge_head_exists = project_root.join(".git/MERGE_HEAD").exists();
+            let rebase_apply_exists = project_root.join(".git/rebase-apply").exists();
+            let rebase_merge_exists = project_root.join(".git/rebase-merge").exists();
+
+            let in_merge = merge_head_exists;
+            let in_rebase = rebase_apply_exists || rebase_merge_exists;
+
+            if !in_merge && !in_rebase {
+                eprintln!("Not currently in a merge or rebase state.");
+                eprintln!("This command should be run during an active merge or rebase conflict.");
+                return;
+            }
+
+            let conflict_type = if in_merge { "merge" } else { "rebase" };
+            eprintln!("Detected {} conflict", conflict_type);
+
+            // Get the conflicting versions based on conflict type
+            let (ours_output, theirs_output) = if in_merge {
+                // For merge conflicts
+                let ours = Command::new("git")
+                    .current_dir(&project_root)
+                    .args(&["show", &format!("HEAD:{}", relative_path.display())])
+                    .output();
+                let theirs = Command::new("git")
+                    .current_dir(&project_root)
+                    .args(&["show", &format!("MERGE_HEAD:{}", relative_path.display())])
+                    .output();
+                (ours, theirs)
+            } else {
+                // For rebase conflicts - use git index stages
+                let ours = Command::new("git")
+                    .current_dir(&project_root)
+                    .args(&["show", &format!(":2:{}", relative_path.display())])
+                    .output();
+                let theirs = Command::new("git")
+                    .current_dir(&project_root)
+                    .args(&["show", &format!(":3:{}", relative_path.display())])
+                    .output();
+                (ours, theirs)
+            };
+
+            // Also try alternative approaches if the above fail
+            let ours_alt_output = if ours_output.as_ref().map_or(true, |o| !o.status.success()) {
+                if in_merge {
+                    Some(
+                        Command::new("git")
+                            .current_dir(&project_root)
+                            .args(&["show", &format!("HEAD~1:{}", relative_path.display())])
+                            .output(),
+                    )
+                } else {
+                    // For rebase, try getting the base version
+                    Some(
+                        Command::new("git")
+                            .current_dir(&project_root)
+                            .args(&["show", &format!("HEAD:{}", relative_path.display())])
+                            .output(),
+                    )
+                }
+            } else {
+                None
+            };
+
+            let theirs_alt_output = if theirs_output.as_ref().map_or(true, |o| !o.status.success())
+            {
+                if in_merge {
+                    // Try getting from the merge commit's second parent
+                    Some(
+                        Command::new("git")
+                            .current_dir(&project_root)
+                            .args(&[
+                                "show",
+                                &format!("$(cat .git/MERGE_HEAD):{}", relative_path.display()),
+                            ])
+                            .output(),
+                    )
+                } else {
+                    // For rebase, try getting from the original commit being applied
+                    let orig_commit_path = if rebase_apply_exists {
+                        project_root.join(".git/rebase-apply/original-commit")
+                    } else {
+                        project_root.join(".git/rebase-merge/stopped-sha")
+                    };
+
+                    if orig_commit_path.exists() {
+                        if let Ok(commit_hash) = std::fs::read_to_string(&orig_commit_path) {
+                            let commit_hash = commit_hash.trim();
+                            Some(
+                                Command::new("git")
+                                    .current_dir(&project_root)
+                                    .args(&[
+                                        "show",
+                                        &format!("{}:{}", commit_hash, relative_path.display()),
+                                    ])
+                                    .output(),
+                            )
+                        } else {
+                            None
+                        }
+                    } else {
+                        None
+                    }
+                }
+            } else {
+                None
+            };
+
+            // Try to get clean versions, with fallbacks
+            let ours_ciphertext = match ours_output {
+                Ok(output) if output.status.success() => {
+                    eprintln!("Successfully extracted ours version using git show");
+                    output.stdout
+                }
+                _ => {
+                    if let Some(Ok(alt_output)) = ours_alt_output {
+                        if alt_output.status.success() {
+                            eprintln!(
+                                "Successfully extracted ours version using alternative method"
+                            );
+                            alt_output.stdout
+                        } else {
+                            eprintln!("Failed to extract ours version:");
+                            if let Ok(ours) = ours_output {
+                                let ref_name = if in_merge { "HEAD" } else { ":2" };
+                                eprintln!(
+                                    "  git show {}:{} failed: {}",
+                                    ref_name,
+                                    relative_path.display(),
+                                    ours.status
+                                );
+                                eprintln!("  stderr: {}", String::from_utf8_lossy(&ours.stderr));
+                            }
+                            eprintln!("  Alternative method also failed: {}", alt_output.status);
+                            eprintln!("  stderr: {}", String::from_utf8_lossy(&alt_output.stderr));
+                            return;
+                        }
+                    } else {
+                        eprintln!("Failed to extract ours version and no alternative available");
+                        return;
+                    }
+                }
+            };
+
+            let theirs_ciphertext = match theirs_output {
+                Ok(output) if output.status.success() => {
+                    eprintln!("Successfully extracted theirs version using git show");
+                    output.stdout
+                }
+                _ => {
+                    if let Some(Ok(alt_output)) = theirs_alt_output {
+                        if alt_output.status.success() {
+                            eprintln!(
+                                "Successfully extracted theirs version using alternative method"
+                            );
+                            alt_output.stdout
+                        } else {
+                            eprintln!("Failed to extract theirs version:");
+                            if let Ok(theirs) = theirs_output {
+                                let ref_name = if in_merge { "MERGE_HEAD" } else { ":3" };
+                                eprintln!(
+                                    "  git show {}:{} failed: {}",
+                                    ref_name,
+                                    relative_path.display(),
+                                    theirs.status
+                                );
+                                eprintln!("  stderr: {}", String::from_utf8_lossy(&theirs.stderr));
+                            }
+                            eprintln!("  Alternative method also failed: {}", alt_output.status);
+                            eprintln!("  stderr: {}", String::from_utf8_lossy(&alt_output.stderr));
+                            return;
+                        }
+                    } else {
+                        eprintln!("Failed to extract theirs version and no alternative available");
+                        return;
+                    }
+                }
+            };
+
+            // Create temporary files for the conflicting versions
+            let ours_temp = temp_file::empty();
+            let theirs_temp = temp_file::empty();
+
+            if let Err(e) = std::fs::write(ours_temp.path(), &ours_ciphertext) {
+                eprintln!("Failed to write ours temp file: {}", e);
+                return;
+            }
+
+            if let Err(e) = std::fs::write(theirs_temp.path(), &theirs_ciphertext) {
+                eprintln!("Failed to write theirs temp file: {}", e);
+                return;
+            }
+
+            eprintln!("Decrypting both versions...");
+            eprintln!("Ours version size: {} bytes", ours_ciphertext.len());
+            eprintln!("Theirs version size: {} bytes", theirs_ciphertext.len());
+
+            // Decrypt both versions
+            let ours_plaintext =
+                plaintext_from_ciphertext_source(ours_temp.path(), identities.clone());
+            let theirs_plaintext =
+                plaintext_from_ciphertext_source(theirs_temp.path(), identities.clone());
+
+            if ours_plaintext.is_empty() || theirs_plaintext.is_empty() {
+                eprintln!("Failed to decrypt one or both conflicting versions");
+                return;
+            }
+
+            // Create temporary files for the decrypted versions
+            let extension = ciphertext
+                .extension()
+                .and_then(|ext| ext.to_str())
+                .unwrap_or("txt");
+
+            let ours_plain_temp =
+                temp_file::TempFile::with_suffix(format!(".ours.{}", extension)).unwrap();
+            let theirs_plain_temp =
+                temp_file::TempFile::with_suffix(format!(".theirs.{}", extension)).unwrap();
+            let merged_temp =
+                temp_file::TempFile::with_suffix(format!(".merged.{}", extension)).unwrap();
+
+            std::fs::write(ours_plain_temp.path(), &ours_plaintext).unwrap();
+            std::fs::write(theirs_plain_temp.path(), &theirs_plaintext).unwrap();
+
+            eprintln!("Attempting automatic merge of plaintext versions...");
+
+            // Try to merge using git merge-file
+            let merge_result = Command::new("git")
+                .args(&[
+                    "merge-file",
+                    "-p",
+                    ours_plain_temp.path().to_str().unwrap(),
+                    ours_plain_temp.path().to_str().unwrap(), // base - using ours as base
+                    theirs_plain_temp.path().to_str().unwrap(),
+                ])
+                .output();
+
+            match merge_result {
+                Ok(output) if output.status.success() => {
+                    // Successful automatic merge
+                    eprintln!("Automatic merge successful!");
+                    std::fs::write(merged_temp.path(), &output.stdout).unwrap();
+                }
+                _ => {
+                    // Merge failed, need manual resolution
+                    eprintln!("Automatic merge failed. Opening editor for manual resolution...");
+                    eprintln!("Ours version: {:?}", ours_plain_temp.path());
+                    eprintln!("Theirs version: {:?}", theirs_plain_temp.path());
+
+                    // Create a file with conflict markers for manual editing
+                    let mut conflict_content = String::new();
+                    let ours_label = if in_merge {
+                        "HEAD (ours)"
+                    } else {
+                        "Current (ours)"
+                    };
+                    let theirs_label = if in_merge {
+                        "MERGE_HEAD (theirs)"
+                    } else {
+                        "Incoming (theirs)"
+                    };
+
+                    conflict_content.push_str(&format!("<<<<<<< {}\n", ours_label));
+                    conflict_content.push_str(&String::from_utf8_lossy(&ours_plaintext));
+                    if !ours_plaintext.ends_with(b"\n") {
+                        conflict_content.push('\n');
+                    }
+                    conflict_content.push_str("=======\n");
+                    conflict_content.push_str(&String::from_utf8_lossy(&theirs_plaintext));
+                    if !theirs_plaintext.ends_with(b"\n") {
+                        conflict_content.push('\n');
+                    }
+                    conflict_content.push_str(&format!(">>>>>>> {}\n", theirs_label));
+
+                    std::fs::write(merged_temp.path(), conflict_content).unwrap();
+
+                    eprintln!(
+                        "Opening merged file in editor: {}",
+                        get_editor().unwrap().display()
+                    );
+                    edit_file(merged_temp.path()).unwrap();
+                }
+            }
+
+            let merged_plaintext = std::fs::read(merged_temp.path()).unwrap();
+
+            if merged_plaintext.is_empty() {
+                eprintln!("Merged plaintext is empty, not writing to {:?}", ciphertext);
+                return;
+            }
+
+            // Check if there are still conflict markers
+            let merged_content = String::from_utf8_lossy(&merged_plaintext);
+            if merged_content.contains("<<<<<<< ") || merged_content.contains(">>>>>>> ") {
+                eprintln!("Warning: Conflict markers still present in merged content");
+                eprintln!("Please resolve all conflicts before proceeding");
+                return;
+            }
+
+            // Show diff information
+            eprintln!("\n=== MERGE SUMMARY ===");
+
+            // Show diff between ours and theirs
+            eprintln!("Differences between conflicting versions:");
+            let diff_result = Command::new("diff")
+                .args(&[
+                    "-u",
+                    ours_plain_temp.path().to_str().unwrap(),
+                    theirs_plain_temp.path().to_str().unwrap(),
+                ])
+                .output();
+
+            match diff_result {
+                Ok(output) => {
+                    let diff_output = String::from_utf8_lossy(&output.stdout);
+                    if !diff_output.trim().is_empty() {
+                        // Replace temp file paths with meaningful labels in diff output
+                        let diff_labeled = diff_output
+                            .replace(
+                                ours_plain_temp.path().to_str().unwrap(),
+                                &format!("{} (ours)", conflict_type),
+                            )
+                            .replace(
+                                theirs_plain_temp.path().to_str().unwrap(),
+                                &format!("{} (theirs)", conflict_type),
+                            );
+                        eprintln!("{}", diff_labeled);
+                    } else {
+                        eprintln!("No differences found between versions");
+                    }
+                }
+                Err(_) => {
+                    // Fallback: show simple line counts
+                    let ours_lines = String::from_utf8_lossy(&ours_plaintext).lines().count();
+                    let theirs_lines = String::from_utf8_lossy(&theirs_plaintext).lines().count();
+                    let merged_lines = merged_content.lines().count();
+                    eprintln!("Ours version: {} lines", ours_lines);
+                    eprintln!("Theirs version: {} lines", theirs_lines);
+                    eprintln!("Merged result: {} lines", merged_lines);
+                }
+            }
+
+            // Show a summary of the final merged content
+            let merged_lines = merged_content.lines().count();
+            let merged_chars = merged_content.len();
+            eprintln!(
+                "\nFinal merged result: {} lines, {} characters",
+                merged_lines, merged_chars
+            );
+
+            // Show first few lines of merged content as preview
+            let preview_lines: Vec<&str> = merged_content.lines().take(5).collect();
+            if !preview_lines.is_empty() {
+                eprintln!(
+                    "Preview of merged content (first {} lines):",
+                    preview_lines.len()
+                );
+                for (i, line) in preview_lines.iter().enumerate() {
+                    eprintln!("  {}: {}", i + 1, line);
+                }
+                if merged_lines > 5 {
+                    eprintln!("  ... ({} more lines)", merged_lines - 5);
+                }
+            }
+            // Show how the final result compares to each original version
+            eprintln!("Changes from ours version to final result:");
+            let ours_to_final_diff = Command::new("diff")
+                .args(&[
+                    "-u",
+                    ours_plain_temp.path().to_str().unwrap(),
+                    merged_temp.path().to_str().unwrap(),
+                ])
+                .output();
+
+            match ours_to_final_diff {
+                Ok(output) if !output.stdout.is_empty() => {
+                    let diff_output = String::from_utf8_lossy(&output.stdout);
+                    let diff_labeled = diff_output
+                        .replace(
+                            ours_plain_temp.path().to_str().unwrap(),
+                            &format!("{} (ours)", conflict_type),
+                        )
+                        .replace(merged_temp.path().to_str().unwrap(), "final result");
+                    eprintln!("{}", diff_labeled);
+                }
+                _ => eprintln!("No changes from ours version"),
+            }
+
+            eprintln!("Changes from theirs version to final result:");
+            let theirs_to_final_diff = Command::new("diff")
+                .args(&[
+                    "-u",
+                    theirs_plain_temp.path().to_str().unwrap(),
+                    merged_temp.path().to_str().unwrap(),
+                ])
+                .output();
+
+            match theirs_to_final_diff {
+                Ok(output) if !output.stdout.is_empty() => {
+                    let diff_output = String::from_utf8_lossy(&output.stdout);
+                    let diff_labeled = diff_output
+                        .replace(
+                            theirs_plain_temp.path().to_str().unwrap(),
+                            &format!("{} (theirs)", conflict_type),
+                        )
+                        .replace(merged_temp.path().to_str().unwrap(), "final result");
+                    eprintln!("{}", diff_labeled);
+                }
+                _ => eprintln!("No changes from theirs version"),
+            }
+
+            eprintln!("====================\n");
+
+            // Encrypt the merged result
+            let merged_ciphertext = ciphertext_from_plaintext_buffer(&merged_plaintext, recipients);
+            std::fs::write(ciphertext, merged_ciphertext).unwrap();
+            eprintln!(
+                "Successfully resolved merge conflicts and wrote to {:?}",
+                ciphertext
+            );
         }
         Commands::Cache => {
             generate_cache_file(&project_root, &cache_file_path);
