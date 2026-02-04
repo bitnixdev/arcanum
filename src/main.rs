@@ -40,6 +40,9 @@ enum Commands {
         plaintext: PathBuf,
     },
 
+    /// Decrypt a file to stdout for textconv (no cache lookup)
+    Textconv { ciphertext: PathBuf },
+
     /// Edit the plaintext of a file
     Edit { ciphertext: PathBuf },
 
@@ -156,10 +159,6 @@ fn main() {
 
     let cli = Cli::parse();
 
-    let cache_file_path = cache_file_path(&project_root);
-    eprintln!("Using cache file at {:?}", cache_file_path);
-    let cache: CacheFile = load_cache_file(&project_root, &cache_file_path);
-
     let identities = identity_files(&cli);
 
     // You can check for the existence of subcommands, and if found use their
@@ -169,6 +168,9 @@ fn main() {
             plaintext,
             ciphertext,
         } => {
+            let cache_file_path = cache_file_path(&project_root);
+            eprintln!("Using cache file at {:?}", cache_file_path);
+            let cache: CacheFile = load_cache_file(&project_root, &cache_file_path);
             let data = if plaintext.display().to_string() == "-" {
                 let mut buffer = String::new();
                 std::io::stdin().read_to_string(&mut buffer).unwrap();
@@ -205,7 +207,14 @@ fn main() {
                 eprintln!("Wrote plaintext to {:?}", plaintext);
             }
         }
+        Commands::Textconv { ciphertext } => {
+            let plaintext_data = plaintext_from_ciphertext_source(ciphertext, identities);
+            std::io::stdout().write_all(&plaintext_data).unwrap();
+        }
         Commands::Rekey { ciphertext } => {
+            let cache_file_path = cache_file_path(&project_root);
+            eprintln!("Using cache file at {:?}", cache_file_path);
+            let cache: CacheFile = load_cache_file(&project_root, &cache_file_path);
             if let Some(ciphertext_path) = ciphertext {
                 // Rekey single file
                 let plaintext_data = plaintext_from_ciphertext_source(ciphertext_path, identities);
@@ -291,6 +300,9 @@ fn main() {
             }
         }
         Commands::Edit { ciphertext } => {
+            let cache_file_path = cache_file_path(&project_root);
+            eprintln!("Using cache file at {:?}", cache_file_path);
+            let cache: CacheFile = load_cache_file(&project_root, &cache_file_path);
             let recipients = cache.recipients_for_file(ciphertext);
             if recipients.is_empty() {
                 eprintln!("No recipients found, unable to edit.");
@@ -332,6 +344,9 @@ fn main() {
             eprintln!("Wrote ciphertext to {:?}", ciphertext);
         }
         Commands::Merge { ciphertext } => {
+            let cache_file_path = cache_file_path(&project_root);
+            eprintln!("Using cache file at {:?}", cache_file_path);
+            let cache: CacheFile = load_cache_file(&project_root, &cache_file_path);
             let recipients = cache.recipients_for_file(ciphertext);
             if recipients.is_empty() {
                 eprintln!("No recipients found for {:?}", ciphertext);
@@ -796,6 +811,7 @@ fn main() {
             );
         }
         Commands::Cache => {
+            let cache_file_path = cache_file_path(&project_root);
             generate_cache_file(&project_root, &cache_file_path);
         }
     }

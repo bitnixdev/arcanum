@@ -40,6 +40,22 @@ arcanum encrypt <plaintext-file> <encrypted-file>
 arcanum decrypt <encrypted-file> <plaintext-file>
 ```
 
+#### Decrypt to stdout (for Git textconv)
+
+```bash
+arcanum textconv <encrypted-file>
+```
+
+Example Git setup:
+
+```bash
+git config diff.arcanum.textconv "arcanum textconv %f"
+```
+
+```gitattributes
+secrets/*.age diff=arcanum
+```
+
 #### Edit an encrypted file
 
 ```bash
