@@ -1,6 +1,6 @@
 {
   inputs = {
-    nixpkgs.url = "github:NixOS/nixpkgs/nixos-25.05";
+    nixpkgs.url = "github:NixOS/nixpkgs/nixos-unstable";
     nixpkgs-staging.url = "github:jasonrm/nixpkgs-staging";
 
     chips = {
@@ -14,5 +14,5 @@
     };
   };
 
-  outputs = { chips, ... }: chips.lib.use { devShellsDir = ./nix/devShells; };
+  outputs = {chips, ...}: chips.lib.use {devShellsDir = ./nix/devShells;};
 }
