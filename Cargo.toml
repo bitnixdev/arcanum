@@ -8,11 +8,11 @@ edition = "2024"
 [dependencies]
 age = { version = "0.11", features = ["armor", "ssh", "cli-common"] }
 clap = { version = "4", features = ["derive", "env"] }
-digest = "0.10"
 dirs = "6"
 edit = "0.1"
+env_logger = "0.11"
+log = "0.4"
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
-sha3 = "0.10"
 temp-file = "0.2"
 toor = "0.4"

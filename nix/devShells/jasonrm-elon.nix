@@ -1,6 +1,5 @@
-{ ... }:
-{
-  imports = [ ./default.nix ];
+{...}: {
+  imports = [./default.nix];
 
   config = {
     dir.project = "/Users/jasonrm/repos/github.com/bitnixdev/arcanum";
