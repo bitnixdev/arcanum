@@ -187,6 +187,9 @@ fn main() {
                 return;
             }
             let ciphertext_data = ciphertext_from_plaintext_buffer(&data, recipients);
+            if let Some(parent) = ciphertext.parent() {
+                std::fs::create_dir_all(parent).unwrap();
+            }
             std::fs::write(ciphertext, ciphertext_data).unwrap();
             eprintln!("Wrote ciphertext to {:?}", ciphertext);
         }
@@ -340,6 +343,9 @@ fn main() {
             // Verify we can decrypt the new ciphertext
             plaintext_from_ciphertext_source(ciphertext_temp.path(), identities);
 
+            if let Some(parent) = ciphertext.parent() {
+                std::fs::create_dir_all(parent).unwrap();
+            }
             std::fs::write(ciphertext, ciphertext_data).unwrap();
             eprintln!("Wrote ciphertext to {:?}", ciphertext);
         }
