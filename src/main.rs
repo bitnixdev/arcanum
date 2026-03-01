@@ -6,7 +6,7 @@ use dirs::cache_dir;
 use edit::{edit_file, get_editor};
 use log::debug;
 use serde::{Deserialize, Serialize};
-use std::collections::{BTreeSet, HashMap};
+use std::collections::{BTreeMap, BTreeSet, HashMap};
 use std::io::{Read, Write};
 use std::path::{Path, PathBuf};
 use std::process::Command;
@@ -51,6 +51,9 @@ enum Commands {
 
     /// Resolve merge conflicts in an encrypted file
     Merge { ciphertext: PathBuf },
+
+    /// List configured files and their recipients
+    List,
 
     /// Regenerate a cache file for the current project
     ///
@@ -809,6 +812,83 @@ fn main() {
                 "Successfully resolved merge conflicts and wrote to {:?}",
                 ciphertext
             );
+        }
+        Commands::List => {
+            let cache: CacheFile = load_cache_file(&project_root);
+            let mut files: BTreeMap<PathBuf, BTreeSet<(char, String)>> = BTreeMap::new();
+
+            if let Some(flake_config) = &cache.flake {
+                for (_, file) in &flake_config.files {
+                    let entry = files.entry(file.source.clone()).or_default();
+                    for r in &flake_config.admin_recipients {
+                        entry.insert(('F', r.clone()));
+                    }
+                    for r in &file.recipients {
+                        entry.insert(('R', r.clone()));
+                    }
+                }
+            }
+
+            if let Some(nixos_configs) = &cache.nixos {
+                for (_, config) in nixos_configs {
+                    for (_, file) in &config.files {
+                        let entry = files.entry(file.source.clone()).or_default();
+                        for r in &config.admin_recipients {
+                            entry.insert(('N', r.clone()));
+                        }
+                        for r in &file.recipients {
+                            entry.insert(('R', r.clone()));
+                        }
+                    }
+                }
+            }
+
+            if let Some(hm_configs) = &cache.home_manager {
+                for (_, config) in hm_configs {
+                    for (_, system) in config {
+                        for (_, file) in &system.files {
+                            let entry = files.entry(file.source.clone()).or_default();
+                            for r in &system.admin_recipients {
+                                entry.insert(('H', r.clone()));
+                            }
+                            for r in &file.recipients {
+                                entry.insert(('R', r.clone()));
+                            }
+                        }
+                    }
+                }
+            }
+
+            if let Some(ds_configs) = &cache.dev_shells {
+                for (_, config) in ds_configs {
+                    for (_, system) in config {
+                        for (_, file) in &system.files {
+                            let entry = files.entry(file.source.clone()).or_default();
+                            for r in &system.admin_recipients {
+                                entry.insert(('D', r.clone()));
+                            }
+                            for r in &file.recipients {
+                                entry.insert(('R', r.clone()));
+                            }
+                        }
+                    }
+                }
+            }
+
+            if files.is_empty() {
+                eprintln!("No files configured.");
+                return;
+            }
+
+            println!("Legend: F=Flake, N=NixOS, H=Home Manager, D=Dev Shell, R=File Recipient");
+            println!();
+            for (path, recipients) in &files {
+                println!("{}", path.display());
+                for (kind, recipient) in recipients {
+                    println!("  {} {}", kind, recipient);
+                }
+                println!();
+            }
         }
         Commands::Cache => {
             if let Some(fingerprint) = get_flake_fingerprint(&project_root) {
