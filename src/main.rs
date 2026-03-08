@@ -85,6 +85,7 @@ struct ArcanumConfig {
 #[serde(rename_all = "camelCase")]
 struct CacheFile {
     nixos: Option<HashMap<String, ArcanumConfig>>,
+    darwin_configurations: Option<HashMap<String, ArcanumConfig>>,
     dev_shells: Option<HashMap<String, HashMap<String, ArcanumConfig>>>,
     home_manager: Option<HashMap<String, HashMap<String, ArcanumConfig>>>,
     flake: Option<ArcanumConfig>,
@@ -107,6 +108,17 @@ impl CacheFile {
                 if source == file.source {
                     recipients.extend(file.recipients.clone());
                     recipients.extend(config.admin_recipients.clone());
+                }
+            }
+        }
+
+        if let Some(darwin_configs) = &self.darwin_configurations {
+            for (_, config) in darwin_configs {
+                for (_, file) in &config.files {
+                    if source == file.source {
+                        recipients.extend(file.recipients.clone());
+                        recipients.extend(config.admin_recipients.clone());
+                    }
                 }
             }
         }
@@ -242,6 +254,17 @@ fn main() {
                 // Collect all files from nixos configs
                 if let Some(nixos_configs) = &cache.nixos {
                     for (_, config) in nixos_configs {
+                        for (_, file) in &config.files {
+                            if file.source.exists() {
+                                files_to_rekey.push(file.source.clone());
+                            }
+                        }
+                    }
+                }
+
+                // Collect all files from darwin configs
+                if let Some(darwin_configs) = &cache.darwin_configurations {
+                    for (_, config) in darwin_configs {
                         for (_, file) in &config.files {
                             if file.source.exists() {
                                 files_to_rekey.push(file.source.clone());
@@ -843,6 +866,20 @@ fn main() {
                 }
             }
 
+            if let Some(darwin_configs) = &cache.darwin_configurations {
+                for (_, config) in darwin_configs {
+                    for (_, file) in &config.files {
+                        let entry = files.entry(file.source.clone()).or_default();
+                        for r in &config.admin_recipients {
+                            entry.insert(('M', r.clone()));
+                        }
+                        for r in &file.recipients {
+                            entry.insert(('R', r.clone()));
+                        }
+                    }
+                }
+            }
+
             if let Some(hm_configs) = &cache.home_manager {
                 for (_, config) in hm_configs {
                     for (_, system) in config {
@@ -880,7 +917,7 @@ fn main() {
                 return;
             }
 
-            println!("Legend: F=Flake, N=NixOS, H=Home Manager, D=Dev Shell, R=File Recipient");
+            println!("Legend: F=Flake, N=NixOS, M=macOS/Darwin, H=Home Manager, D=Dev Shell, R=File Recipient");
             println!();
             for (path, recipients) in &files {
                 println!("{}", path.display());
