@@ -85,7 +85,7 @@ struct ArcanumConfig {
 #[serde(rename_all = "camelCase")]
 struct CacheFile {
     nixos: Option<HashMap<String, ArcanumConfig>>,
-    darwin_configurations: Option<HashMap<String, ArcanumConfig>>,
+    darwin: Option<HashMap<String, ArcanumConfig>>,
     dev_shells: Option<HashMap<String, HashMap<String, ArcanumConfig>>>,
     home_manager: Option<HashMap<String, HashMap<String, ArcanumConfig>>>,
     flake: Option<ArcanumConfig>,
@@ -112,7 +112,7 @@ impl CacheFile {
             }
         }
 
-        if let Some(darwin_configs) = &self.darwin_configurations {
+        if let Some(darwin_configs) = &self.darwin {
             for (_, config) in darwin_configs {
                 for (_, file) in &config.files {
                     if source == file.source {
@@ -263,7 +263,7 @@ fn main() {
                 }
 
                 // Collect all files from darwin configs
-                if let Some(darwin_configs) = &cache.darwin_configurations {
+                if let Some(darwin_configs) = &cache.darwin {
                     for (_, config) in darwin_configs {
                         for (_, file) in &config.files {
                             if file.source.exists() {
@@ -866,7 +866,7 @@ fn main() {
                 }
             }
 
-            if let Some(darwin_configs) = &cache.darwin_configurations {
+            if let Some(darwin_configs) = &cache.darwin {
                 for (_, config) in darwin_configs {
                     for (_, file) in &config.files {
                         let entry = files.entry(file.source.clone()).or_default();
