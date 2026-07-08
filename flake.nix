@@ -14,5 +14,10 @@
     };
   };
 
-  outputs = {chips, ...}: chips.lib.use {devShellsDir = ./nix/devShells;};
+  outputs = inputs @ {chips, ...}:
+    chips.lib.mkFlake {inherit inputs;} {
+      sources = {
+        devShells = ./nix/devShells;
+      };
+    };
 }
