@@ -1,7 +1,7 @@
 use age::armor::{ArmoredReader, Format};
 use age::cli_common::{StdinGuard, read_identities};
 use age::{Identity, Recipient};
-use clap::{Parser, Subcommand};
+use clap::{Parser, Subcommand, ValueEnum};
 use dirs::cache_dir;
 use edit::{edit_file, get_editor};
 use log::debug;
@@ -52,6 +52,21 @@ enum Commands {
     /// Resolve merge conflicts in an encrypted file
     Merge { ciphertext: PathBuf },
 
+    /// Show plaintext diffs for changed encrypted files
+    Diff {
+        /// Version-control backend to query
+        #[arg(long, value_enum, default_value = "auto")]
+        vcs: VcsArg,
+
+        /// Compare current files with this jj revset or git ref
+        #[arg(long, value_name = "REV")]
+        from: Option<String>,
+
+        /// Encrypted files or directories to include
+        #[arg(value_name = "FILE")]
+        files: Vec<PathBuf>,
+    },
+
     /// List configured files and their recipients
     List,
 
@@ -59,6 +74,19 @@ enum Commands {
     ///
     /// Needed when adding new files to the project or changing the recipients.
     Cache,
+}
+
+#[derive(Copy, Clone, Debug, Eq, PartialEq, ValueEnum)]
+enum VcsArg {
+    Auto,
+    Jj,
+    Git,
+}
+
+#[derive(Copy, Clone, Debug, Eq, PartialEq)]
+enum Vcs {
+    Jj,
+    Git,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -90,7 +118,6 @@ struct CacheFile {
     home_manager: Option<HashMap<String, HashMap<String, ArcanumConfig>>>,
     flake: Option<ArcanumConfig>,
 }
-
 
 impl CacheFile {
     fn recipients_for_file(&self, source: &Path) -> Vec<Box<dyn Recipient + Send>> {
@@ -168,7 +195,7 @@ fn main() {
     env_logger::init();
     let cwd = std::env::current_dir().unwrap();
     let config = Config { root_pattern: None };
-    let project_root = find_project_root(cwd, config);
+    let project_root = find_project_root(cwd.clone(), config);
     if project_root.is_none() {
         panic!("Could not find project root, are you in a project?");
     }
@@ -836,6 +863,19 @@ fn main() {
                 ciphertext
             );
         }
+        Commands::Diff { vcs, from, files } => {
+            if let Err(e) = show_secret_diff(
+                &project_root,
+                &cwd,
+                identities,
+                *vcs,
+                from.as_deref(),
+                files,
+            ) {
+                eprintln!("{}", e);
+                std::process::exit(1);
+            }
+        }
         Commands::List => {
             let cache: CacheFile = load_cache_file(&project_root);
             let mut files: BTreeMap<PathBuf, BTreeSet<(char, String)>> = BTreeMap::new();
@@ -917,7 +957,9 @@ fn main() {
                 return;
             }
 
-            println!("Legend: F=Flake, N=NixOS, M=macOS/Darwin, H=Home Manager, D=Dev Shell, R=File Recipient");
+            println!(
+                "Legend: F=Flake, N=NixOS, M=macOS/Darwin, H=Home Manager, D=Dev Shell, R=File Recipient"
+            );
             println!();
             for (path, recipients) in &files {
                 println!("{}", path.display());
@@ -937,6 +979,399 @@ fn main() {
             }
         }
     }
+}
+
+fn show_secret_diff(
+    project_root: &Path,
+    cwd: &Path,
+    identities: Vec<String>,
+    vcs_arg: VcsArg,
+    from: Option<&str>,
+    files: &[PathBuf],
+) -> Result<(), String> {
+    let vcs = resolve_vcs(project_root, vcs_arg)?;
+    let file_args = project_relative_files(files, cwd, project_root)?;
+    let changed_paths = changed_paths(vcs, project_root, from, &file_args)?;
+    let explicit_files = !file_args.is_empty();
+    let base_rev = from.unwrap_or(default_base_rev(vcs));
+    let mut saw_encrypted_file = false;
+    let mut printed_diff = false;
+
+    if changed_paths.is_empty() {
+        eprintln!("No changed files found.");
+        return Ok(());
+    }
+
+    for path in changed_paths {
+        let old_ciphertext = read_base_file(vcs, project_root, base_rev, &path)?;
+        let new_ciphertext = read_current_file(vcs, project_root, &path)?;
+        let old_is_age = old_ciphertext
+            .as_deref()
+            .is_some_and(looks_like_age_ciphertext);
+        let new_is_age = new_ciphertext
+            .as_deref()
+            .is_some_and(looks_like_age_ciphertext);
+
+        if !old_is_age && !new_is_age {
+            if explicit_files {
+                eprintln!("Skipping {}: not an age ciphertext", path.display());
+            }
+            continue;
+        }
+
+        saw_encrypted_file = true;
+
+        let old_plaintext = if old_is_age {
+            let ciphertext = old_ciphertext.as_deref().unwrap();
+            decrypt_ciphertext_buffer(ciphertext, &identities).map_err(|e| {
+                format!(
+                    "Failed to decrypt {} at {}: {}",
+                    path.display(),
+                    base_rev,
+                    e
+                )
+            })?
+        } else {
+            Vec::new()
+        };
+
+        let new_plaintext = if new_is_age {
+            let ciphertext = new_ciphertext.as_deref().unwrap();
+            decrypt_ciphertext_buffer(ciphertext, &identities)
+                .map_err(|e| format!("Failed to decrypt current {}: {}", path.display(), e))?
+        } else {
+            Vec::new()
+        };
+
+        if old_plaintext == new_plaintext {
+            continue;
+        }
+
+        let old_label = if old_is_age {
+            format!("a/{} ({})", path.display(), base_rev)
+        } else {
+            "/dev/null".to_string()
+        };
+        let new_label = if new_is_age {
+            format!("b/{} (current)", path.display())
+        } else {
+            "/dev/null".to_string()
+        };
+
+        if print_plaintext_diff(&old_label, &old_plaintext, &new_label, &new_plaintext)? {
+            printed_diff = true;
+        }
+    }
+
+    if !saw_encrypted_file {
+        eprintln!("No changed encrypted files found.");
+    } else if !printed_diff {
+        eprintln!("No plaintext changes in changed encrypted files.");
+    }
+
+    Ok(())
+}
+
+fn resolve_vcs(project_root: &Path, vcs_arg: VcsArg) -> Result<Vcs, String> {
+    match vcs_arg {
+        VcsArg::Auto => {
+            if command_succeeds(project_root, "jj", &["root"]) {
+                Ok(Vcs::Jj)
+            } else if command_succeeds(project_root, "git", &["rev-parse", "--show-toplevel"]) {
+                Ok(Vcs::Git)
+            } else {
+                Err("Could not find a jj or git repository.".to_string())
+            }
+        }
+        VcsArg::Jj => {
+            if command_succeeds(project_root, "jj", &["root"]) {
+                Ok(Vcs::Jj)
+            } else {
+                Err("Could not find a jj repository.".to_string())
+            }
+        }
+        VcsArg::Git => {
+            if command_succeeds(project_root, "git", &["rev-parse", "--show-toplevel"]) {
+                Ok(Vcs::Git)
+            } else {
+                Err("Could not find a git repository.".to_string())
+            }
+        }
+    }
+}
+
+fn command_succeeds(project_root: &Path, program: &str, args: &[&str]) -> bool {
+    Command::new(program)
+        .current_dir(project_root)
+        .args(args)
+        .output()
+        .map(|output| output.status.success())
+        .unwrap_or(false)
+}
+
+fn default_base_rev(vcs: Vcs) -> &'static str {
+    match vcs {
+        Vcs::Jj => "@-",
+        Vcs::Git => "HEAD",
+    }
+}
+
+fn project_relative_files(
+    files: &[PathBuf],
+    cwd: &Path,
+    project_root: &Path,
+) -> Result<Vec<PathBuf>, String> {
+    let mut relative_files = Vec::new();
+    let normalized_project_root = normalize_path(project_root);
+    for file in files {
+        let absolute = if file.is_absolute() {
+            file.clone()
+        } else {
+            cwd.join(file)
+        };
+        let absolute = normalize_path(&absolute);
+        let relative = absolute
+            .strip_prefix(&normalized_project_root)
+            .map_err(|_| {
+                format!(
+                    "{} is not inside project root {}",
+                    file.display(),
+                    project_root.display()
+                )
+            })?;
+        relative_files.push(relative.to_path_buf());
+    }
+    Ok(relative_files)
+}
+
+fn normalize_path(path: &Path) -> PathBuf {
+    let mut normalized = PathBuf::new();
+    for component in path.components() {
+        match component {
+            std::path::Component::CurDir => {}
+            std::path::Component::ParentDir => {
+                normalized.pop();
+            }
+            _ => normalized.push(component.as_os_str()),
+        }
+    }
+    normalized
+}
+
+fn changed_paths(
+    vcs: Vcs,
+    project_root: &Path,
+    from: Option<&str>,
+    files: &[PathBuf],
+) -> Result<Vec<PathBuf>, String> {
+    let output = match vcs {
+        Vcs::Jj => {
+            let mut command = Command::new("jj");
+            command
+                .current_dir(project_root)
+                .arg("diff")
+                .arg("--name-only")
+                .arg("--from")
+                .arg(from.unwrap_or(default_base_rev(vcs)))
+                .arg("--to")
+                .arg("@");
+            if !files.is_empty() {
+                command.arg("--");
+                for file in files {
+                    command.arg(file);
+                }
+            }
+            command
+                .output()
+                .map_err(|e| format!("Failed to run jj diff: {}", e))?
+        }
+        Vcs::Git => {
+            let mut command = Command::new("git");
+            command
+                .current_dir(project_root)
+                .arg("diff")
+                .arg("--name-only")
+                .arg(from.unwrap_or(default_base_rev(vcs)))
+                .arg("--");
+            for file in files {
+                command.arg(file);
+            }
+            command
+                .output()
+                .map_err(|e| format!("Failed to run git diff: {}", e))?
+        }
+    };
+
+    if !output.status.success() {
+        return Err(format!(
+            "{} diff failed:\n{}",
+            vcs_name(vcs),
+            command_output_error(&output)
+        ));
+    }
+
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    let mut paths = stdout
+        .lines()
+        .filter(|line| !line.trim().is_empty())
+        .map(PathBuf::from)
+        .collect::<Vec<_>>();
+    paths.sort();
+    paths.dedup();
+    Ok(paths)
+}
+
+fn vcs_name(vcs: Vcs) -> &'static str {
+    match vcs {
+        Vcs::Jj => "jj",
+        Vcs::Git => "git",
+    }
+}
+
+fn command_output_error(output: &std::process::Output) -> String {
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    if !stderr.trim().is_empty() {
+        return stderr.trim().to_string();
+    }
+    String::from_utf8_lossy(&output.stdout).trim().to_string()
+}
+
+fn read_base_file(
+    vcs: Vcs,
+    project_root: &Path,
+    base_rev: &str,
+    path: &Path,
+) -> Result<Option<Vec<u8>>, String> {
+    match vcs {
+        Vcs::Jj => read_jj_file(project_root, base_rev, path),
+        Vcs::Git => read_git_revision_file(project_root, base_rev, path),
+    }
+}
+
+fn read_current_file(
+    vcs: Vcs,
+    project_root: &Path,
+    path: &Path,
+) -> Result<Option<Vec<u8>>, String> {
+    match vcs {
+        Vcs::Jj => read_jj_file(project_root, "@", path),
+        Vcs::Git => match std::fs::read(project_root.join(path)) {
+            Ok(contents) => Ok(Some(contents)),
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(None),
+            Err(e) => Err(format!("Failed to read {}: {}", path.display(), e)),
+        },
+    }
+}
+
+fn read_jj_file(
+    project_root: &Path,
+    revision: &str,
+    path: &Path,
+) -> Result<Option<Vec<u8>>, String> {
+    let output = Command::new("jj")
+        .current_dir(project_root)
+        .arg("file")
+        .arg("show")
+        .arg("--revision")
+        .arg(revision)
+        .arg(path)
+        .output()
+        .map_err(|e| format!("Failed to run jj file show: {}", e))?;
+
+    if output.status.success() {
+        Ok(Some(output.stdout))
+    } else {
+        Ok(None)
+    }
+}
+
+fn read_git_revision_file(
+    project_root: &Path,
+    revision: &str,
+    path: &Path,
+) -> Result<Option<Vec<u8>>, String> {
+    let revision_path = format!("{}:{}", revision, path.display());
+    let output = Command::new("git")
+        .current_dir(project_root)
+        .arg("show")
+        .arg("--no-ext-diff")
+        .arg(revision_path)
+        .output()
+        .map_err(|e| format!("Failed to run git show: {}", e))?;
+
+    if output.status.success() {
+        Ok(Some(output.stdout))
+    } else {
+        Ok(None)
+    }
+}
+
+fn looks_like_age_ciphertext(contents: &[u8]) -> bool {
+    let first_non_whitespace = contents
+        .iter()
+        .position(|byte| !byte.is_ascii_whitespace())
+        .unwrap_or(contents.len());
+    let trimmed = &contents[first_non_whitespace..];
+    trimmed.starts_with(b"-----BEGIN AGE ENCRYPTED FILE-----")
+        || trimmed.starts_with(b"age-encryption.org/v1")
+}
+
+fn decrypt_ciphertext_buffer(contents: &[u8], identities: &[String]) -> Result<Vec<u8>, String> {
+    let armor_reader = ArmoredReader::new(contents);
+    let decryptor =
+        age::Decryptor::new(armor_reader).map_err(|e| format!("Invalid age ciphertext: {}", e))?;
+
+    let mut decrypted = vec![];
+    let mut stdin_guard = StdinGuard::new(true);
+    let identity = read_identities(identities.to_vec(), Some(30), &mut stdin_guard)
+        .map_err(|e| format!("Failed to read identities: {}", e))?;
+    let identity_refs: Vec<&dyn Identity> = identity.iter().map(|i| i.as_ref()).collect();
+    let mut reader = decryptor
+        .decrypt(identity_refs.into_iter())
+        .map_err(|_| "You do not have an identity able to decrypt this file.".to_string())?;
+    reader
+        .read_to_end(&mut decrypted)
+        .map_err(|e| format!("Failed to decrypt ciphertext: {}", e))?;
+
+    Ok(decrypted)
+}
+
+fn print_plaintext_diff(
+    old_label: &str,
+    old_plaintext: &[u8],
+    new_label: &str,
+    new_plaintext: &[u8],
+) -> Result<bool, String> {
+    let old_temp = temp_file::empty();
+    let new_temp = temp_file::empty();
+    std::fs::write(old_temp.path(), old_plaintext)
+        .map_err(|e| format!("Failed to write diff input: {}", e))?;
+    std::fs::write(new_temp.path(), new_plaintext)
+        .map_err(|e| format!("Failed to write diff input: {}", e))?;
+
+    let output = Command::new("diff")
+        .arg("-u")
+        .arg("--label")
+        .arg(old_label)
+        .arg("--label")
+        .arg(new_label)
+        .arg(old_temp.path())
+        .arg(new_temp.path())
+        .output()
+        .map_err(|e| format!("Failed to run diff: {}", e))?;
+
+    if !output.status.success() && output.status.code() != Some(1) {
+        return Err(format!("diff failed:\n{}", command_output_error(&output)));
+    }
+
+    if output.stdout.is_empty() {
+        return Ok(false);
+    }
+
+    std::io::stdout()
+        .write_all(&output.stdout)
+        .map_err(|e| format!("Failed to write diff output: {}", e))?;
+    Ok(true)
 }
 
 fn cache_dir_path() -> PathBuf {

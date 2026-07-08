@@ -80,6 +80,16 @@ arcanum merge <encrypted-file>
 
 Helps resolve merge conflicts in encrypted files by providing a clean merge interface.
 
+#### Show plaintext diffs for changed secrets
+
+```bash
+arcanum diff [--from <rev>] [--vcs auto|jj|git] [encrypted-file ...]
+```
+
+Shows unified plaintext diffs for changed age-encrypted files. By default this uses the current jj
+working copy when available, or git staged/working-tree changes otherwise. Use `--from` to compare
+the current files with an arbitrary jj revset, bookmark, git commit, or branch.
+
 #### Generate cache file
 
 ```bash
