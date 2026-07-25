@@ -18,6 +18,44 @@ Arcanum is a command-line utility for encrypting and managing sensitive files us
 
 ## Installation
 
+### Nix / NixOS
+
+The flake exposes `packages.<system>.arcanum` and an overlay via `overlays.default`
+(through [nix-chips](https://github.com/jasonrm/nix-chips)). Use either:
+
+```nix
+{
+  inputs.arcanum.url = "github:bitnixdev/arcanum";
+
+  outputs = {nixpkgs, arcanum, ...}: {
+    nixosConfigurations.example = nixpkgs.lib.nixosSystem {
+      system = "x86_64-linux";
+      modules = [
+        ({pkgs, ...}: {
+          nixpkgs.overlays = [arcanum.overlays.default];
+          environment.systemPackages = [pkgs.arcanum];
+        })
+      ];
+    };
+  };
+}
+```
+
+Or reference the package without an overlay:
+
+```nix
+environment.systemPackages = [
+  inputs.arcanum.packages.${pkgs.system}.arcanum
+];
+```
+
+Build or run from the flake directly:
+
+```bash
+nix build github:bitnixdev/arcanum
+nix run github:bitnixdev/arcanum -- --help
+```
+
 ### Using Cargo
 
 ```bash

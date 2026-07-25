@@ -18,6 +18,7 @@
     chips.lib.mkFlake {inherit inputs;} {
       sources = {
         devShells = ./nix/devShells;
+        packages = ./nix/packages;
       };
     };
 }
