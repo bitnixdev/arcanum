@@ -102,6 +102,12 @@ struct ArcanumFile {
     recipients: Vec<String>,
 }
 
+#[derive(Debug, Deserialize)]
+struct EditFile {
+    dest: PathBuf,
+    source: PathBuf,
+}
+
 #[derive(Debug, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 struct ArcanumConfig {
@@ -188,6 +194,60 @@ impl CacheFile {
             }
         }
         boxed_recipients
+    }
+}
+
+fn update_edited_plaintext(
+    project_root: &Path,
+    ciphertext: &Path,
+    plaintext: &[u8],
+) -> Result<Vec<PathBuf>, String> {
+    let Some(files) = std::env::var_os("ARCANUM_EDIT_FILES") else {
+        return Ok(Vec::new());
+    };
+    let files: Vec<EditFile> = serde_json::from_slice(files.as_encoded_bytes())
+        .map_err(|e| format!("Invalid ARCANUM_EDIT_FILES: {}", e))?;
+    update_edited_plaintext_files(project_root, ciphertext, plaintext, files)
+}
+
+fn update_edited_plaintext_files(
+    project_root: &Path,
+    ciphertext: &Path,
+    plaintext: &[u8],
+    files: Vec<EditFile>,
+) -> Result<Vec<PathBuf>, String> {
+    let ciphertext = absolute_path(project_root, ciphertext);
+    let mut updated = Vec::new();
+
+    for file in files {
+        if absolute_path(project_root, &file.source) != ciphertext {
+            continue;
+        }
+        if let Some(parent) = file.dest.parent() {
+            std::fs::create_dir_all(parent)
+                .map_err(|e| format!("Failed to create {:?}: {}", parent, e))?;
+        }
+        std::fs::write(&file.dest, plaintext)
+            .map_err(|e| format!("Failed to update {:?}: {}", file.dest, e))?;
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            std::fs::set_permissions(&file.dest, std::fs::Permissions::from_mode(0o600))
+                .map_err(|e| format!("Failed to restrict {:?}: {}", file.dest, e))?;
+        }
+        updated.push(file.dest);
+    }
+
+    updated.sort();
+    updated.dedup();
+    Ok(updated)
+}
+
+fn absolute_path(project_root: &Path, path: &Path) -> PathBuf {
+    if path.is_absolute() {
+        path.to_path_buf()
+    } else {
+        project_root.join(path)
     }
 }
 
@@ -557,6 +617,17 @@ fn main() {
             }
             std::fs::write(ciphertext, ciphertext_data).unwrap();
             eprintln!("Wrote ciphertext to {:?}", ciphertext);
+            match update_edited_plaintext(&project_root, ciphertext, &plaintext_data) {
+                Ok(destinations) => {
+                    for destination in destinations {
+                        eprintln!("Updated decrypted file at {:?}", destination);
+                    }
+                }
+                Err(e) => {
+                    eprintln!("{}", e);
+                    std::process::exit(1);
+                }
+            }
         }
         Commands::Merge { ciphertext } => {
             let cache: CacheFile = load_cache_file(&project_root);
@@ -818,9 +889,11 @@ fn main() {
                     None
                 }
             };
-            let (Some(ours_plain_temp), Some(theirs_plain_temp), Some(merged_temp)) =
-                (plain_temp("ours"), plain_temp("theirs"), plain_temp("merged"))
-            else {
+            let (Some(ours_plain_temp), Some(theirs_plain_temp), Some(merged_temp)) = (
+                plain_temp("ours"),
+                plain_temp("theirs"),
+                plain_temp("merged"),
+            ) else {
                 return;
             };
 
@@ -1768,10 +1841,74 @@ mod tests {
     }
 
     #[test]
+    fn edited_plaintext_updates_only_the_matching_destination() {
+        let matching = temp_file::empty();
+        let other = temp_file::empty();
+        std::fs::write(matching.path(), b"old matching value").unwrap();
+        std::fs::write(other.path(), b"old other value").unwrap();
+        let files = vec![
+            EditFile {
+                source: PathBuf::from("secrets/project.env.age"),
+                dest: matching.path().to_path_buf(),
+            },
+            EditFile {
+                source: PathBuf::from("secrets/other.env.age"),
+                dest: other.path().to_path_buf(),
+            },
+        ];
+
+        let updated = update_edited_plaintext_files(
+            Path::new("/project"),
+            Path::new("secrets/project.env.age"),
+            b"new matching value",
+            files,
+        )
+        .unwrap();
+
+        assert_eq!(updated, vec![matching.path().to_path_buf()]);
+        assert_eq!(
+            std::fs::read(matching.path()).unwrap(),
+            b"new matching value"
+        );
+        assert_eq!(std::fs::read(other.path()).unwrap(), b"old other value");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn updated_plaintext_is_only_readable_by_the_owner() {
+        use std::os::unix::fs::PermissionsExt;
+        let destination = temp_file::empty();
+        let files = vec![EditFile {
+            source: PathBuf::from("secrets/project.env.age"),
+            dest: destination.path().to_path_buf(),
+        }];
+
+        update_edited_plaintext_files(
+            Path::new("/project"),
+            Path::new("secrets/project.env.age"),
+            b"plaintext",
+            files,
+        )
+        .unwrap();
+
+        let mode = std::fs::metadata(destination.path())
+            .unwrap()
+            .permissions()
+            .mode();
+        assert_eq!(mode & 0o777, 0o600, "{:o}", mode);
+    }
+
+    #[test]
     fn plaintext_temp_file_is_named_after_the_ciphertext() {
         let temp = PlaintextTempFile::new(Path::new("secrets/github-actions.toml.age"), None)
             .expect("temp file");
-        let name = temp.path().file_name().unwrap().to_str().unwrap().to_string();
+        let name = temp
+            .path()
+            .file_name()
+            .unwrap()
+            .to_str()
+            .unwrap()
+            .to_string();
         assert!(name.starts_with("github-actions."), "{}", name);
         assert!(name.ends_with(".toml"), "{}", name);
         assert!(temp.path().exists());
@@ -1781,7 +1918,13 @@ mod tests {
     fn plaintext_temp_file_includes_the_label() {
         let temp = PlaintextTempFile::new(Path::new("secrets/project.env.age"), Some("ours"))
             .expect("temp file");
-        let name = temp.path().file_name().unwrap().to_str().unwrap().to_string();
+        let name = temp
+            .path()
+            .file_name()
+            .unwrap()
+            .to_str()
+            .unwrap()
+            .to_string();
         assert!(name.starts_with("project.ours."), "{}", name);
         assert!(name.ends_with(".env"), "{}", name);
     }

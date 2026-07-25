@@ -100,7 +100,9 @@ secrets/*.age diff=arcanum
 arcanum edit <encrypted-file>
 ```
 
-Opens the decrypted content in your default editor, then re-encrypts after editing.
+Opens the decrypted content in your default editor, then re-encrypts after editing. When run
+inside a nix-chips dev shell, it also updates the configured decrypted destination for that
+secret without requiring `direnv reload`.
 
 #### Re-encrypt files
 
