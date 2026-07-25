@@ -191,6 +191,164 @@ impl CacheFile {
     }
 }
 
+/// Best-effort removal of plaintext temp files when arcanum is killed while an
+/// editor still has one open. `Drop` covers the normal path; this covers the
+/// signals a terminal or a supervisor can send us.
+#[cfg(unix)]
+mod signal_cleanup {
+    use std::ffi::CString;
+    use std::os::unix::ffi::OsStrExt;
+    use std::path::Path;
+    use std::ptr;
+    use std::sync::Once;
+    use std::sync::atomic::{AtomicPtr, Ordering};
+
+    /// More slots than any one command needs; merge uses the most, at three.
+    const SLOTS: usize = 8;
+
+    /// Paths are kept as leaked C strings so the handler only has to call
+    /// `unlink(2)`, which is async-signal-safe. The strings are never freed:
+    /// reclaiming one could race a handler that already read the pointer.
+    static PATHS: [AtomicPtr<libc::c_char>; SLOTS] =
+        [const { AtomicPtr::new(ptr::null_mut()) }; SLOTS];
+
+    static INSTALL: Once = Once::new();
+
+    const CAUGHT: [libc::c_int; 4] = [libc::SIGHUP, libc::SIGINT, libc::SIGQUIT, libc::SIGTERM];
+
+    extern "C" fn handler(sig: libc::c_int) {
+        for slot in &PATHS {
+            let path = slot.swap(ptr::null_mut(), Ordering::AcqRel);
+            if !path.is_null() {
+                unsafe { libc::unlink(path) };
+            }
+        }
+        // Die the way we were asked to, so the exit status is not a lie.
+        unsafe {
+            libc::signal(sig, libc::SIG_DFL);
+            libc::raise(sig);
+        }
+    }
+
+    fn install() {
+        INSTALL.call_once(|| {
+            let handler = handler as extern "C" fn(libc::c_int) as libc::sighandler_t;
+            for sig in CAUGHT {
+                unsafe { libc::signal(sig, handler) };
+            }
+        });
+    }
+
+    /// Registers `path` for removal on signal, returning the slot it claimed.
+    pub fn register(path: &Path) -> Option<usize> {
+        install();
+        let raw = CString::new(path.as_os_str().as_bytes()).ok()?.into_raw();
+        for (index, slot) in PATHS.iter().enumerate() {
+            if slot
+                .compare_exchange(ptr::null_mut(), raw, Ordering::AcqRel, Ordering::Acquire)
+                .is_ok()
+            {
+                return Some(index);
+            }
+        }
+        // Out of slots. The file is still removed on drop.
+        unsafe { drop(CString::from_raw(raw)) };
+        None
+    }
+
+    /// Releases a slot after the file is gone, so a later signal cannot unlink
+    /// a path that something else has since reused.
+    pub fn unregister(slot: usize) {
+        PATHS[slot].store(ptr::null_mut(), Ordering::Release);
+    }
+}
+
+/// A temp file holding decrypted plaintext, named after the encrypted file with
+/// its `.age` suffix stripped so editors pick the right syntax mode:
+/// `secrets/github-actions.toml.age` becomes `github-actions.<id>.toml`.
+///
+/// The file is removed on drop and, on unix, when arcanum is killed by a
+/// catchable signal while the editor is still running.
+struct PlaintextTempFile {
+    file: temp_file::TempFile,
+    #[cfg(unix)]
+    slot: Option<usize>,
+}
+
+impl PlaintextTempFile {
+    /// `label` is inserted before the random id, e.g. `Some("ours")` yields
+    /// `github-actions.ours.<id>.toml`.
+    fn new(ciphertext: &Path, label: Option<&str>) -> Result<Self, String> {
+        let (stem, extension) = plaintext_name_parts(ciphertext);
+        let prefix = match label {
+            Some(label) => format!("{}.{}.", stem, label),
+            None => format!("{}.", stem),
+        };
+        let file = temp_file::TempFileBuilder::new()
+            .prefix(prefix)
+            .suffix(format!(".{}", extension))
+            .build()
+            .map_err(|e| format!("Failed to create temp file: {}", e))?;
+
+        // Created empty, so this lands before any plaintext is written.
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            std::fs::set_permissions(file.path(), std::fs::Permissions::from_mode(0o600))
+                .map_err(|e| format!("Failed to restrict {:?}: {}", file.path(), e))?;
+        }
+
+        #[cfg(unix)]
+        let slot = signal_cleanup::register(file.path());
+
+        Ok(Self {
+            file,
+            #[cfg(unix)]
+            slot,
+        })
+    }
+
+    fn path(&self) -> &Path {
+        self.file.path()
+    }
+}
+
+impl Drop for PlaintextTempFile {
+    fn drop(&mut self) {
+        // Remove before releasing the slot, so a signal arriving in between
+        // still finds a live registration. `temp_file`'s own drop then no-ops.
+        let _ = std::fs::remove_file(self.file.path());
+        #[cfg(unix)]
+        if let Some(slot) = self.slot {
+            signal_cleanup::unregister(slot);
+        }
+    }
+}
+
+/// Splits an encrypted path into the stem and extension to use for its
+/// plaintext temp file: `github-actions.toml.age` -> `("github-actions", "toml")`.
+fn plaintext_name_parts(ciphertext: &Path) -> (String, String) {
+    let inner = if ciphertext.extension().is_some_and(|ext| ext == "age") {
+        ciphertext.file_stem()
+    } else {
+        ciphertext.file_name()
+    };
+    let inner = Path::new(inner.unwrap_or_else(|| std::ffi::OsStr::new("")));
+
+    let stem = inner
+        .file_stem()
+        .and_then(|stem| stem.to_str())
+        .filter(|stem| !stem.is_empty())
+        .unwrap_or("arcanum");
+    let extension = inner
+        .extension()
+        .and_then(|ext| ext.to_str())
+        .filter(|ext| !ext.is_empty())
+        .unwrap_or("txt");
+
+    (stem.to_string(), extension.to_string())
+}
+
 fn main() {
     env_logger::init();
     let cwd = std::env::current_dir().unwrap();
@@ -363,11 +521,13 @@ fn main() {
 
             let original_plaintext_data =
                 plaintext_from_ciphertext_source(ciphertext, identities.clone());
-            let extension = ciphertext
-                .extension()
-                .and_then(|ext| ext.to_str())
-                .unwrap_or("txt");
-            let t = temp_file::TempFile::with_suffix(format!(".{}", extension)).unwrap();
+            let t = match PlaintextTempFile::new(ciphertext, None) {
+                Ok(t) => t,
+                Err(e) => {
+                    eprintln!("{}", e);
+                    std::process::exit(1);
+                }
+            };
             std::fs::write(t.path(), &original_plaintext_data).unwrap();
             eprintln!(
                 "Opening plaintext in editor: {}",
@@ -651,17 +811,18 @@ fn main() {
             }
 
             // Create temporary files for the decrypted versions
-            let extension = ciphertext
-                .extension()
-                .and_then(|ext| ext.to_str())
-                .unwrap_or("txt");
-
-            let ours_plain_temp =
-                temp_file::TempFile::with_suffix(format!(".ours.{}", extension)).unwrap();
-            let theirs_plain_temp =
-                temp_file::TempFile::with_suffix(format!(".theirs.{}", extension)).unwrap();
-            let merged_temp =
-                temp_file::TempFile::with_suffix(format!(".merged.{}", extension)).unwrap();
+            let plain_temp = |label: &str| match PlaintextTempFile::new(ciphertext, Some(label)) {
+                Ok(temp) => Some(temp),
+                Err(e) => {
+                    eprintln!("{}", e);
+                    None
+                }
+            };
+            let (Some(ours_plain_temp), Some(theirs_plain_temp), Some(merged_temp)) =
+                (plain_temp("ours"), plain_temp("theirs"), plain_temp("merged"))
+            else {
+                return;
+            };
 
             std::fs::write(ours_plain_temp.path(), &ours_plaintext).unwrap();
             std::fs::write(theirs_plain_temp.path(), &theirs_plaintext).unwrap();
@@ -1576,4 +1737,112 @@ fn ciphertext_from_plaintext_buffer(
     writer.finish().unwrap();
     armored_writer.finish().unwrap();
     encrypted
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn plaintext_name_parts_strips_the_age_suffix() {
+        assert_eq!(
+            plaintext_name_parts(Path::new("secrets/github-actions.toml.age")),
+            ("github-actions".to_string(), "toml".to_string())
+        );
+    }
+
+    #[test]
+    fn plaintext_name_parts_falls_back_when_there_is_no_inner_extension() {
+        assert_eq!(
+            plaintext_name_parts(Path::new("secrets/project.age")),
+            ("project".to_string(), "txt".to_string())
+        );
+    }
+
+    #[test]
+    fn plaintext_name_parts_handles_paths_that_are_not_age_files() {
+        assert_eq!(
+            plaintext_name_parts(Path::new("secrets/project.env")),
+            ("project".to_string(), "env".to_string())
+        );
+    }
+
+    #[test]
+    fn plaintext_temp_file_is_named_after_the_ciphertext() {
+        let temp = PlaintextTempFile::new(Path::new("secrets/github-actions.toml.age"), None)
+            .expect("temp file");
+        let name = temp.path().file_name().unwrap().to_str().unwrap().to_string();
+        assert!(name.starts_with("github-actions."), "{}", name);
+        assert!(name.ends_with(".toml"), "{}", name);
+        assert!(temp.path().exists());
+    }
+
+    #[test]
+    fn plaintext_temp_file_includes_the_label() {
+        let temp = PlaintextTempFile::new(Path::new("secrets/project.env.age"), Some("ours"))
+            .expect("temp file");
+        let name = temp.path().file_name().unwrap().to_str().unwrap().to_string();
+        assert!(name.starts_with("project.ours."), "{}", name);
+        assert!(name.ends_with(".env"), "{}", name);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn plaintext_temp_file_is_only_readable_by_the_owner() {
+        use std::os::unix::fs::PermissionsExt;
+        let temp =
+            PlaintextTempFile::new(Path::new("secrets/project.env.age"), None).expect("temp file");
+        let mode = std::fs::metadata(temp.path()).unwrap().permissions().mode();
+        assert_eq!(mode & 0o777, 0o600, "{:o}", mode);
+    }
+
+    #[test]
+    fn plaintext_temp_file_is_removed_on_drop() {
+        let path = {
+            let temp = PlaintextTempFile::new(Path::new("secrets/project.env.age"), None)
+                .expect("temp file");
+            std::fs::write(temp.path(), b"plaintext").unwrap();
+            temp.path().to_path_buf()
+        };
+        assert!(!path.exists(), "{:?} was left behind", path);
+    }
+
+    /// Re-runs itself in a child process that gets killed mid-"edit", which is
+    /// the only way to observe the signal handler without killing the harness.
+    #[cfg(unix)]
+    #[test]
+    fn plaintext_temp_file_is_removed_when_killed_by_a_signal() {
+        const REPORT_TO: &str = "ARCANUM_TEST_SIGNAL_REPORT_TO";
+
+        if let Ok(report_to) = std::env::var(REPORT_TO) {
+            let temp = PlaintextTempFile::new(Path::new("secrets/project.env.age"), None)
+                .expect("temp file");
+            std::fs::write(temp.path(), b"plaintext").unwrap();
+            std::fs::write(&report_to, temp.path().as_os_str().as_encoded_bytes()).unwrap();
+            unsafe { libc::raise(libc::SIGTERM) };
+            unreachable!("SIGTERM should have terminated the child");
+        }
+
+        let report_to = temp_file::empty();
+        let status = Command::new(std::env::current_exe().unwrap())
+            .args([
+                "--exact",
+                "--quiet",
+                "tests::plaintext_temp_file_is_removed_when_killed_by_a_signal",
+            ])
+            .env(REPORT_TO, report_to.path())
+            .status()
+            .expect("re-run test binary");
+
+        assert_eq!(
+            status.code(),
+            None,
+            "child should have died from the signal, not exited"
+        );
+
+        let reported = std::fs::read(report_to.path()).unwrap();
+        assert!(!reported.is_empty(), "child never reported its temp file");
+        let leaked = PathBuf::from(String::from_utf8(reported).unwrap());
+        assert!(!leaked.exists(), "{:?} survived the signal", leaked);
+    }
 }
