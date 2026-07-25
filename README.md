@@ -102,7 +102,8 @@ arcanum edit <encrypted-file>
 
 Opens the decrypted content in your default editor, then re-encrypts after editing. When run
 inside a nix-chips dev shell, it also updates the configured decrypted destination for that
-secret without requiring `direnv reload`.
+secret without requiring `direnv reload`. Relative encrypted-file paths are resolved from the
+project root, so the command behaves the same way from any directory in the project.
 
 #### Re-encrypt files
 

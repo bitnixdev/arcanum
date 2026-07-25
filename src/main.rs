@@ -579,9 +579,10 @@ fn main() {
                 std::process::exit(1);
             }
 
+            let ciphertext_path = absolute_path(&project_root, ciphertext);
             let original_plaintext_data =
-                plaintext_from_ciphertext_source(ciphertext, identities.clone());
-            let t = match PlaintextTempFile::new(ciphertext, None) {
+                plaintext_from_ciphertext_source(&ciphertext_path, identities.clone());
+            let t = match PlaintextTempFile::new(&ciphertext_path, None) {
                 Ok(t) => t,
                 Err(e) => {
                     eprintln!("{}", e);
@@ -596,11 +597,17 @@ fn main() {
             edit_file(&t.path()).unwrap();
             let plaintext_data = std::fs::read(t.path()).unwrap();
             if plaintext_data.is_empty() {
-                eprintln!("edited plaintext is empty, not writing to {:?}", ciphertext);
+                eprintln!(
+                    "edited plaintext is empty, not writing to {:?}",
+                    ciphertext_path
+                );
                 return;
             }
             if plaintext_data == original_plaintext_data {
-                eprintln!("Plaintext is unchanged, not writing to {:?}", ciphertext);
+                eprintln!(
+                    "Plaintext is unchanged, not writing to {:?}",
+                    ciphertext_path
+                );
                 eprintln!(
                     "If you want to re-encrypt the files to new recipents, use the 'rekey' command."
                 );
@@ -612,12 +619,12 @@ fn main() {
             // Verify we can decrypt the new ciphertext
             plaintext_from_ciphertext_source(ciphertext_temp.path(), identities);
 
-            if let Some(parent) = ciphertext.parent() {
+            if let Some(parent) = ciphertext_path.parent() {
                 std::fs::create_dir_all(parent).unwrap();
             }
-            std::fs::write(ciphertext, ciphertext_data).unwrap();
-            eprintln!("Wrote ciphertext to {:?}", ciphertext);
-            match update_edited_plaintext(&project_root, ciphertext, &plaintext_data) {
+            std::fs::write(&ciphertext_path, ciphertext_data).unwrap();
+            eprintln!("Wrote ciphertext to {:?}", ciphertext_path);
+            match update_edited_plaintext(&project_root, &ciphertext_path, &plaintext_data) {
                 Ok(destinations) => {
                     for destination in destinations {
                         eprintln!("Updated decrypted file at {:?}", destination);
@@ -1837,6 +1844,28 @@ mod tests {
         assert_eq!(
             plaintext_name_parts(Path::new("secrets/project.env")),
             ("project".to_string(), "env".to_string())
+        );
+    }
+
+    #[test]
+    fn relative_paths_are_resolved_from_the_project_root() {
+        assert_eq!(
+            absolute_path(
+                Path::new("/project"),
+                Path::new("secrets/github-actions.toml.age")
+            ),
+            PathBuf::from("/project/secrets/github-actions.toml.age")
+        );
+    }
+
+    #[test]
+    fn absolute_paths_are_not_changed() {
+        assert_eq!(
+            absolute_path(
+                Path::new("/project"),
+                Path::new("/elsewhere/github-actions.toml.age")
+            ),
+            PathBuf::from("/elsewhere/github-actions.toml.age")
         );
     }
 
