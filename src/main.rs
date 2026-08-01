@@ -2,16 +2,16 @@ use age::armor::{ArmoredReader, Format};
 use age::cli_common::{StdinGuard, read_identities};
 use age::{Identity, Recipient};
 use clap::{Parser, Subcommand, ValueEnum};
+use digest::Digest;
 use dirs::cache_dir;
 use edit::{edit_file, get_editor};
-use log::debug;
 use serde::{Deserialize, Serialize};
+use sha3::Sha3_256;
 use std::collections::{BTreeMap, BTreeSet, HashMap};
 use std::io::{Read, Write};
 use std::path::{Path, PathBuf};
 use std::process::Command;
 use std::str::FromStr;
-use std::time::Instant;
 use toor::config::Config;
 use toor::project::find_project_root;
 
@@ -223,19 +223,20 @@ fn update_edited_plaintext_files(
         if absolute_path(project_root, &file.source) != ciphertext {
             continue;
         }
-        if let Some(parent) = file.dest.parent() {
+        let destination = normalize_path(&absolute_path(project_root, &file.dest));
+        if let Some(parent) = destination.parent() {
             std::fs::create_dir_all(parent)
                 .map_err(|e| format!("Failed to create {:?}: {}", parent, e))?;
         }
-        std::fs::write(&file.dest, plaintext)
-            .map_err(|e| format!("Failed to update {:?}: {}", file.dest, e))?;
+        std::fs::write(&destination, plaintext)
+            .map_err(|e| format!("Failed to update {:?}: {}", destination, e))?;
         #[cfg(unix)]
         {
             use std::os::unix::fs::PermissionsExt;
-            std::fs::set_permissions(&file.dest, std::fs::Permissions::from_mode(0o600))
-                .map_err(|e| format!("Failed to restrict {:?}: {}", file.dest, e))?;
+            std::fs::set_permissions(&destination, std::fs::Permissions::from_mode(0o600))
+                .map_err(|e| format!("Failed to restrict {:?}: {}", destination, e))?;
         }
-        updated.push(file.dest);
+        updated.push(destination);
     }
 
     updated.sort();
@@ -410,7 +411,6 @@ fn plaintext_name_parts(ciphertext: &Path) -> (String, String) {
 }
 
 fn main() {
-    env_logger::init();
     let cwd = std::env::current_dir().unwrap();
     let config = Config { root_pattern: None };
     let project_root = find_project_root(cwd.clone(), config);
@@ -1211,13 +1211,8 @@ fn main() {
             }
         }
         Commands::Cache => {
-            if let Some(fingerprint) = get_flake_fingerprint(&project_root) {
-                let cache_path = cache_file_path_for_fingerprint(&fingerprint);
-                generate_cache_file(&project_root, &cache_path);
-            } else {
-                eprintln!("could not determine flake fingerprint, evaluating without caching");
-                generate_cache_file_uncached(&project_root);
-            }
+            let cache_path = cache_file_path(&project_root);
+            generate_cache_file(&project_root, &cache_path);
         }
     }
 }
@@ -1615,48 +1610,16 @@ fn print_plaintext_diff(
     Ok(true)
 }
 
-fn cache_dir_path() -> PathBuf {
-    let dir = cache_dir().unwrap().join("arcanum");
+fn cache_file_path(project_root: &Path) -> PathBuf {
+    let mut hasher = Sha3_256::new();
+    hasher.update(project_root.to_string_lossy().as_bytes());
+    let hash = hasher.finalize();
+    let hash = format!("{:x}", hash)[..8].to_string();
+    let dir = cache_dir().unwrap();
     if !dir.exists() {
         std::fs::create_dir_all(&dir).unwrap();
     }
-    dir
-}
-
-fn cache_file_path_for_fingerprint(fingerprint: &str) -> PathBuf {
-    cache_dir_path().join(format!("{}.json", fingerprint))
-}
-
-fn cleanup_old_cache_files() {
-    let dir = cache_dir_path();
-    let max_age = std::time::Duration::from_secs(7 * 24 * 60 * 60);
-    let entries = match std::fs::read_dir(&dir) {
-        Ok(entries) => entries,
-        Err(e) => {
-            debug!("failed to read cache directory for cleanup: {}", e);
-            return;
-        }
-    };
-    for entry in entries.flatten() {
-        let path = entry.path();
-        if path.extension().and_then(|e| e.to_str()) != Some("json") {
-            continue;
-        }
-        let metadata = match entry.metadata() {
-            Ok(m) => m,
-            Err(_) => continue,
-        };
-        let modified = match metadata.modified() {
-            Ok(t) => t,
-            Err(_) => continue,
-        };
-        if let Ok(age) = modified.elapsed() {
-            if age > max_age {
-                debug!("removing old cache file: {:?}", path);
-                let _ = std::fs::remove_file(&path);
-            }
-        }
-    }
+    dir.join(format!("arcanum-{}.json", hash))
 }
 
 fn identity_files(cli: &Cli) -> Vec<String> {
@@ -1678,79 +1641,18 @@ fn identity_files(cli: &Cli) -> Vec<String> {
     identities
 }
 
-fn get_flake_fingerprint(project_root: &Path) -> Option<String> {
-    debug!("running: nix flake metadata --json");
-    let start = Instant::now();
-    let result = Command::new("nix")
-        .args(["flake", "metadata", "--json"])
-        .current_dir(project_root)
-        .output();
-    let elapsed = start.elapsed();
-    debug!("nix flake metadata completed in {:.2?}", elapsed);
-
-    match result {
-        Ok(output) if output.status.success() => {
-            let json_str = String::from_utf8_lossy(&output.stdout);
-            let metadata: serde_json::Value = match serde_json::from_str(&json_str) {
-                Ok(v) => v,
-                Err(e) => {
-                    debug!("failed to parse flake metadata JSON: {}", e);
-                    return None;
-                }
-            };
-            let fingerprint = metadata
-                .get("fingerprint")
-                .and_then(|v| v.as_str())
-                .map(|s| s.to_string());
-            debug!("flake fingerprint: {:?}", fingerprint);
-            fingerprint
-        }
-        Ok(output) => {
-            debug!(
-                "nix flake metadata failed (exit {}): {}",
-                output.status,
-                String::from_utf8_lossy(&output.stderr)
-            );
-            None
-        }
-        Err(e) => {
-            debug!("nix flake metadata failed to execute: {}", e);
-            None
-        }
-    }
-}
-
 fn load_cache_file(project_root: &Path) -> CacheFile {
-    if let Some(fingerprint) = get_flake_fingerprint(project_root) {
-        let cache_path = cache_file_path_for_fingerprint(&fingerprint);
-        if cache_path.exists() {
-            let data = std::fs::read_to_string(&cache_path).unwrap();
-            if let Ok(cache_file) = serde_json::from_str::<CacheFile>(&data) {
-                debug!("cache hit (fingerprint: {})", fingerprint);
-                return cache_file;
-            }
-            debug!("cache file corrupt, regenerating");
-        } else {
-            debug!("no cache for fingerprint {}, generating", fingerprint);
+    let cache = cache_file_path(project_root);
+    if cache.exists() {
+        let data = std::fs::read_to_string(&cache).unwrap();
+        if let Ok(cache_file) = serde_json::from_str::<CacheFile>(&data) {
+            return cache_file;
         }
-        generate_cache_file(project_root, &cache_path)
-    } else {
-        debug!("could not determine flake fingerprint, evaluating without caching");
-        generate_cache_file_uncached(project_root)
     }
+    generate_cache_file(project_root, &cache)
 }
 
 fn generate_cache_file(project_root: &Path, cache: &Path) -> CacheFile {
-    let cache_file = generate_cache_file_uncached(project_root);
-    let data = serde_json::to_string(&cache_file).unwrap();
-    std::fs::write(cache, data).unwrap();
-    cleanup_old_cache_files();
-    cache_file
-}
-
-fn generate_cache_file_uncached(project_root: &Path) -> CacheFile {
-    debug!("running: nix eval --json .#lib.arcanum");
-    let start = Instant::now();
     let result = Command::new("nix")
         .arg("eval")
         .arg("--json")
@@ -1758,8 +1660,6 @@ fn generate_cache_file_uncached(project_root: &Path) -> CacheFile {
         .current_dir(project_root)
         .output()
         .unwrap();
-    let elapsed = start.elapsed();
-    debug!("nix eval completed in {:.2?}", elapsed);
 
     if !result.status.success() {
         eprintln!("nix eval failed");
@@ -1768,7 +1668,9 @@ fn generate_cache_file_uncached(project_root: &Path) -> CacheFile {
         std::process::exit(1);
     }
     let data = String::from_utf8(result.stdout).unwrap();
-    serde_json::from_str(&data).unwrap()
+    let cache_file = serde_json::from_str(&data).unwrap();
+    std::fs::write(cache, data).unwrap();
+    cache_file
 }
 
 fn plaintext_from_ciphertext_source(source: &Path, identities: Vec<String>) -> Vec<u8> {
@@ -1900,6 +1802,35 @@ mod tests {
             b"new matching value"
         );
         assert_eq!(std::fs::read(other.path()).unwrap(), b"old other value");
+    }
+
+    #[test]
+    fn relative_destination_is_resolved_from_the_project_root() {
+        let project_root = {
+            let placeholder = temp_file::empty();
+            let path = placeholder.path().to_path_buf();
+            drop(placeholder);
+            std::fs::create_dir(&path).unwrap();
+            path
+        };
+        let destination = PathBuf::from(".github-actions.toml");
+        let files = vec![EditFile {
+            source: PathBuf::from("secrets/github-actions.toml.age"),
+            dest: destination,
+        }];
+
+        let updated = update_edited_plaintext_files(
+            &project_root,
+            Path::new("secrets/github-actions.toml.age"),
+            b"plaintext",
+            files,
+        )
+        .unwrap();
+
+        let destination = project_root.join(".github-actions.toml");
+        assert_eq!(updated, vec![destination.clone()]);
+        assert_eq!(std::fs::read(&destination).unwrap(), b"plaintext");
+        std::fs::remove_dir_all(project_root).unwrap();
     }
 
     #[cfg(unix)]

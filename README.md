@@ -137,7 +137,7 @@ the current files with an arbitrary jj revset, bookmark, git commit, or branch.
 arcanum cache
 ```
 
-Regenerates cache files for the current project. This is needed when adding new files or changing recipients.
+Regenerates the cache file for the current project. This is needed when adding new files or changing recipients.
 
 ### Identity Management
 
