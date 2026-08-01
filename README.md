@@ -62,6 +62,12 @@ nix run github:bitnixdev/arcanum -- --help
 cargo install --path .
 ```
 
+## Versioning and releases
+
+Pushes to `master` publish the SemVer declared in `Cargo.toml` as a GitHub
+release, with binaries for Linux, macOS, and Windows. Bump the package version
+before pushing; the release fails rather than overwrite an existing tag.
+
 ## Usage
 
 ### Basic Commands
