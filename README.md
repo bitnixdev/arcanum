@@ -20,8 +20,9 @@ Arcanum is a command-line utility for encrypting and managing sensitive files us
 
 ### Nix / NixOS
 
-The flake exposes `packages.<system>.arcanum` and an overlay via `overlays.default`
-(through [nix-chips](https://github.com/jasonrm/nix-chips)). Use either:
+The flake exposes `packages.<system>.arcanum`, `overlays.default`, and integration
+modules for NixOS, nix-darwin, Home Manager, and nix-chips development shells.
+Use either the overlay:
 
 ```nix
 {
@@ -31,6 +32,7 @@ The flake exposes `packages.<system>.arcanum` and an overlay via `overlays.defau
     nixosConfigurations.example = nixpkgs.lib.nixosSystem {
       system = "x86_64-linux";
       modules = [
+        arcanum.nixosModules.default
         ({pkgs, ...}: {
           nixpkgs.overlays = [arcanum.overlays.default];
           environment.systemPackages = [pkgs.arcanum];
@@ -47,6 +49,24 @@ Or reference the package without an overlay:
 environment.systemPackages = [
   inputs.arcanum.packages.${pkgs.system}.arcanum
 ];
+```
+
+The other module outputs are:
+
+```nix
+arcanum.darwinModules.default
+arcanum.homeManagerModules.default
+arcanum.chipsModules.default
+```
+
+Pass `chipsModules.default` through `modules.chips` when using nix-chips:
+
+```nix
+chips.lib.mkFlake {
+  inherit inputs;
+  modules.chips = [arcanum.chipsModules.default];
+  nixpkgs.overlays = [arcanum.overlays.default];
+}
 ```
 
 Build or run from the flake directly:

@@ -19,7 +19,14 @@
       inherit inputs;
       sources = {
         devShells = ./nix/devShells;
+        nixosModules = ./nix/modules/nixos;
         packages = ./nix/packages;
+      };
+      modules.chips = [./nix/modules/chips/default.nix];
+      outputs = {
+        chipsModules.default = import ./nix/modules/chips/default.nix;
+        darwinModules.default = import ./nix/modules/nix-darwin/default.nix;
+        homeManagerModules.default = import ./nix/modules/home-manager/default.nix;
       };
     };
 }

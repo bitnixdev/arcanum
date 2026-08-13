@@ -2,23 +2,19 @@
   "nodes": {
     "chips": {
       "inputs": {
-        "home-manager": "home-manager",
         "nixpkgs": [
           "nixpkgs"
         ],
         "nixpkgs-staging": [
           "nixpkgs-staging"
-        ],
-        "nixpkgs-unstable": "nixpkgs-unstable",
-        "rust-overlay": "rust-overlay",
-        "utils": "utils"
+        ]
       },
       "locked": {
-        "lastModified": 1784887101,
-        "narHash": "sha256-pUotcdjSNE+WQWzhtOHUqeOmUrlHADYPgHEWkt37fwI=",
+        "lastModified": 1786606792,
+        "narHash": "sha256-Th6B5DIM+UH/x5UuCRC5Nk0FyBR2CdW5UP+2UwzXR2o=",
         "owner": "jasonrm",
         "repo": "nix-chips",
-        "rev": "f52a9ec8108d6320635d4586d591115478bc26d6",
+        "rev": "fef22c9a1b6f4e72bf5c2c8a9f798e87f3c955dc",
         "type": "github"
       },
       "original": {
@@ -45,7 +41,7 @@
     },
     "flake-utils": {
       "inputs": {
-        "systems": "systems_2"
+        "systems": "systems"
       },
       "locked": {
         "lastModified": 1731533236,
@@ -58,27 +54,6 @@
       "original": {
         "owner": "numtide",
         "repo": "flake-utils",
-        "type": "github"
-      }
-    },
-    "home-manager": {
-      "inputs": {
-        "nixpkgs": [
-          "chips",
-          "nixpkgs"
-        ]
-      },
-      "locked": {
-        "lastModified": 1783550008,
-        "narHash": "sha256-qbbZUk9IG9dLNwCPwdPBs6I5clxwugRpP+1YU+GPK20=",
-        "owner": "nix-community",
-        "repo": "home-manager",
-        "rev": "f4d01c1d87c7c2ec909549165d5a8338f1bd3315",
-        "type": "github"
-      },
-      "original": {
-        "owner": "nix-community",
-        "repo": "home-manager",
         "type": "github"
       }
     },
@@ -102,8 +77,8 @@
       "inputs": {
         "flake-compat": "flake-compat",
         "nixpkgs": "nixpkgs_2",
-        "rust-overlay": "rust-overlay_2",
-        "utils": "utils_2"
+        "rust-overlay": "rust-overlay",
+        "utils": "utils"
       },
       "locked": {
         "lastModified": 1784965146,
@@ -116,22 +91,6 @@
       "original": {
         "owner": "jasonrm",
         "repo": "nixpkgs-staging",
-        "type": "github"
-      }
-    },
-    "nixpkgs-unstable": {
-      "locked": {
-        "lastModified": 1783224372,
-        "narHash": "sha256-8i/87eeoqiGE4yOTjwSA3Eh/ziJRQEmd/unYU+K27sk=",
-        "owner": "NixOS",
-        "repo": "nixpkgs",
-        "rev": "d407951447dcd00442e97087bf374aad70c04cea",
-        "type": "github"
-      },
-      "original": {
-        "owner": "NixOS",
-        "ref": "nixos-unstable",
-        "repo": "nixpkgs",
         "type": "github"
       }
     },
@@ -160,27 +119,6 @@
       }
     },
     "rust-overlay": {
-      "inputs": {
-        "nixpkgs": [
-          "chips",
-          "nixpkgs"
-        ]
-      },
-      "locked": {
-        "lastModified": 1783577481,
-        "narHash": "sha256-EWMxOWrJ031f8f/lrcEmhTRs4npw1/5N3Hcjin846c8=",
-        "owner": "oxalica",
-        "repo": "rust-overlay",
-        "rev": "4cdea398dc491b082dccdce0fad1ed0b75fa3394",
-        "type": "github"
-      },
-      "original": {
-        "owner": "oxalica",
-        "repo": "rust-overlay",
-        "type": "github"
-      }
-    },
-    "rust-overlay_2": {
       "inputs": {
         "nixpkgs": [
           "nixpkgs-staging",
@@ -231,42 +169,9 @@
         "type": "github"
       }
     },
-    "systems_3": {
-      "locked": {
-        "lastModified": 1681028828,
-        "narHash": "sha256-Vy1rq5AaRuLzOxct8nz4T6wlgyUR7zLU309k9mBC768=",
-        "owner": "nix-systems",
-        "repo": "default",
-        "rev": "da67096a3b9bf56a91d16901293e51ba5b49a27e",
-        "type": "github"
-      },
-      "original": {
-        "owner": "nix-systems",
-        "repo": "default",
-        "type": "github"
-      }
-    },
     "utils": {
       "inputs": {
-        "systems": "systems"
-      },
-      "locked": {
-        "lastModified": 1731533236,
-        "narHash": "sha256-l0KFg5HjrsfsO/JpG+r7fRrqm12kzFHyUHqHCVpMMbI=",
-        "owner": "numtide",
-        "repo": "flake-utils",
-        "rev": "11707dc2f618dd54ca8739b309ec4fc024de578b",
-        "type": "github"
-      },
-      "original": {
-        "owner": "numtide",
-        "repo": "flake-utils",
-        "type": "github"
-      }
-    },
-    "utils_2": {
-      "inputs": {
-        "systems": "systems_3"
+        "systems": "systems_2"
       },
       "locked": {
         "lastModified": 1731533236,
