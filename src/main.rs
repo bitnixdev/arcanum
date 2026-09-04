@@ -53,12 +53,15 @@ enum Commands {
     Merge { ciphertext: PathBuf },
 
     /// Show plaintext diffs for changed encrypted files
+    ///
+    /// With jj, the default comparison ends at the working-copy parent so the
+    /// most recently committed change is shown even when the working copy is empty.
     Diff {
         /// Version-control backend to query
         #[arg(long, value_enum, default_value = "auto")]
         vcs: VcsArg,
 
-        /// Compare current files with this jj revset or git ref
+        /// Compare the jj working-copy parent or Git working tree with this revision
         #[arg(long, value_name = "REV")]
         from: Option<String>,
 
@@ -1273,8 +1276,17 @@ fn show_secret_diff(
 
         let new_plaintext = if new_is_age {
             let ciphertext = new_ciphertext.as_deref().unwrap();
-            decrypt_ciphertext_buffer(ciphertext, &identities)
-                .map_err(|e| format!("Failed to decrypt current {}: {}", path.display(), e))?
+            decrypt_ciphertext_buffer(ciphertext, &identities).map_err(
+                |e| match diff_target_rev(vcs) {
+                    Some(revision) => format!(
+                        "Failed to decrypt {} at {}: {}",
+                        path.display(),
+                        revision,
+                        e
+                    ),
+                    None => format!("Failed to decrypt current {}: {}", path.display(), e),
+                },
+            )?
         } else {
             Vec::new()
         };
@@ -1289,7 +1301,10 @@ fn show_secret_diff(
             "/dev/null".to_string()
         };
         let new_label = if new_is_age {
-            format!("b/{} (current)", path.display())
+            match diff_target_rev(vcs) {
+                Some(revision) => format!("b/{} ({})", path.display(), revision),
+                None => format!("b/{} (current)", path.display()),
+            }
         } else {
             "/dev/null".to_string()
         };
@@ -1347,8 +1362,17 @@ fn command_succeeds(project_root: &Path, program: &str, args: &[&str]) -> bool {
 
 fn default_base_rev(vcs: Vcs) -> &'static str {
     match vcs {
-        Vcs::Jj => "@-",
+        Vcs::Jj => "@--",
         Vcs::Git => "HEAD",
+    }
+}
+
+fn diff_target_rev(vcs: Vcs) -> Option<&'static str> {
+    match vcs {
+        // `jj commit` leaves an empty working-copy commit. Diff its parent so
+        // the change that was just committed does not disappear from output.
+        Vcs::Jj => Some("@-"),
+        Vcs::Git => None,
     }
 }
 
@@ -1406,11 +1430,18 @@ fn changed_paths(
             command
                 .current_dir(project_root)
                 .arg("diff")
-                .arg("--name-only")
-                .arg("--from")
-                .arg(from.unwrap_or(default_base_rev(vcs)))
-                .arg("--to")
-                .arg("@");
+                .arg("--name-only");
+            if let Some(from) = from {
+                command
+                    .arg("--from")
+                    .arg(from)
+                    .arg("--to")
+                    .arg(diff_target_rev(vcs).expect("jj has a revision diff target"));
+            } else {
+                command
+                    .arg("--revision")
+                    .arg(diff_target_rev(vcs).expect("jj has a revision diff target"));
+            }
             if !files.is_empty() {
                 command.arg("--");
                 for file in files {
@@ -1490,7 +1521,11 @@ fn read_current_file(
     path: &Path,
 ) -> Result<Option<Vec<u8>>, String> {
     match vcs {
-        Vcs::Jj => read_jj_file(project_root, "@", path),
+        Vcs::Jj => read_jj_file(
+            project_root,
+            diff_target_rev(vcs).expect("jj has a revision diff target"),
+            path,
+        ),
         Vcs::Git => match std::fs::read(project_root.join(path)) {
             Ok(contents) => Ok(Some(contents)),
             Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(None),
@@ -1724,6 +1759,18 @@ fn ciphertext_from_plaintext_buffer(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn jj_diff_defaults_to_the_working_copy_parent() {
+        assert_eq!(default_base_rev(Vcs::Jj), "@--");
+        assert_eq!(diff_target_rev(Vcs::Jj), Some("@-"));
+    }
+
+    #[test]
+    fn git_diff_defaults_to_head_and_the_working_tree() {
+        assert_eq!(default_base_rev(Vcs::Git), "HEAD");
+        assert_eq!(diff_target_rev(Vcs::Git), None);
+    }
 
     #[test]
     fn plaintext_name_parts_strips_the_age_suffix() {

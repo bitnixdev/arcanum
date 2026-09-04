@@ -153,9 +153,10 @@ Helps resolve merge conflicts in encrypted files by providing a clean merge inte
 arcanum diff [--from <rev>] [--vcs auto|jj|git] [encrypted-file ...]
 ```
 
-Shows unified plaintext diffs for changed age-encrypted files. By default this uses the current jj
-working copy when available, or git staged/working-tree changes otherwise. Use `--from` to compare
-the current files with an arbitrary jj revset, bookmark, git commit, or branch.
+Shows unified plaintext diffs for changed age-encrypted files. By default, jj diffs the working-copy
+parent (`jj diff -r @-`), so the most recently committed change remains visible when the working copy
+is empty. Git uses staged/working-tree changes. Use `--from` to compare an arbitrary jj revset,
+bookmark, git commit, or branch with the jj working-copy parent or Git working tree.
 
 #### Generate cache file
 
